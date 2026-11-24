@@ -1,0 +1,54 @@
+*.pyc
+*.map
+*.dblite
+*.elf
+*.hex
+*.axf
+*.exe
+*.pdb
+*.idb
+*.ilk
+*.old
+build
+Debug
+documentation/html
+*~
+*.o
+*.obj
+*.out
+*.bak
+*.dep
+*.lib
+*.i
+*.d
+.DS_Stor*
+.config 3
+.config 4
+.config 5
+Midea-X1
+*.uimg
+GPATH
+GRTAGS
+GTAGS
+.vscode
+JLinkLog.txt
+JLinkSettings.ini
+DebugConfig/
+RTE/
+settings/
+*.uvguix*
+cconfig.h
+!edgeprotecttools.exe
+/makefile.targets
+
+# SDK files restored by tools/prepare_sdk.ps1. This repository tracks the BSP overrides.
+/libraries/
+/libs/
+/rt-thread/
+/tools/edgeprotecttools/
+/resources/55500A1.clm_blob
+/resources/55500A1.trxcse
+/resources/cyw55513modpse84som_rev3.txt
+/tools/received_jpg/
+wifi.cfg
+*.log

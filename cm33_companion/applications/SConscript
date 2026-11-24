@@ -1,0 +1,11 @@
+import rtconfig
+from building import *
+import os
+
+cwd = GetCurrentDir()
+hal_dir = os.path.abspath(os.path.join(cwd, '..', '..', 'libraries', 'HAL_Drivers')).replace('\\', '/')
+path = [cwd, hal_dir]
+src = Glob('*.c')
+
+group = DefineGroup('Applications', src, depend=[''], CPPPATH=path)
+Return('group')

@@ -1,0 +1,17 @@
+import os
+Import('RTT_ROOT')
+from building import *
+
+cwd = GetCurrentDir()
+objs = []
+
+skip_dirs = {'build', 'Debug', 'config', '__pycache__'}
+
+for d in os.listdir(cwd):
+    if d.startswith('.') or d in skip_dirs:
+        continue
+    path = os.path.join(cwd, d)
+    if os.path.isfile(os.path.join(path, 'SConscript')):
+        objs = objs + SConscript(os.path.join(d, 'SConscript'))
+
+Return('objs')

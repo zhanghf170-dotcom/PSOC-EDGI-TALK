@@ -1,0 +1,110 @@
+import os
+import sys
+import rtconfig
+import platform
+import subprocess
+import uuid
+
+SDK_ROOT = os.path.abspath('./')
+WORKSPACE_ROOT = os.path.abspath(os.path.join(SDK_ROOT, '..'))
+RTT_ROOT = os.path.normpath(os.path.join(WORKSPACE_ROOT, 'rt-thread'))
+
+sys.path = sys.path + [os.path.join(RTT_ROOT, 'tools')]
+try:
+    from building import *
+except Exception as e:
+    print("Error message:", e)
+    print('Cannot find RT-Thread root directory:', RTT_ROOT)
+    sys.exit(-1)
+
+TARGET = 'rt-thread.' + rtconfig.TARGET_EXT
+
+DefaultEnvironment(tools=[])
+env = Environment(tools=['mingw'], ENV=os.environ,
+    AS=rtconfig.AS, ASFLAGS=rtconfig.AFLAGS,
+    CC=rtconfig.CC, CFLAGS=rtconfig.CFLAGS,
+    AR=rtconfig.AR, ARFLAGS='-rc',
+    CXX=rtconfig.CXX, CXXFLAGS=rtconfig.CXXFLAGS,
+    LINK=rtconfig.LINK, LINKFLAGS=rtconfig.LFLAGS)
+env.PrependENVPath('PATH', rtconfig.EXEC_PATH)
+env.AppendUnique(CPPPATH=[SDK_ROOT])
+
+OBJCOPY = os.path.join(rtconfig.EXEC_PATH, 'arm-none-eabi-objcopy')
+
+Export('RTT_ROOT')
+Export('rtconfig')
+
+libraries_path_prefix = os.path.join(WORKSPACE_ROOT, 'libraries', 'components')
+SDK_LIB = libraries_path_prefix
+Export('SDK_LIB')
+
+objs = PrepareBuilding(env, RTT_ROOT, has_libcpu=False)
+
+rtconfig.BSP_LIBRARY_TYPE = 'Packages'
+
+def ourspawn(sh, escape, cmd, args, e):
+    filename = str(uuid.uuid4())
+    newargs = ' '.join(args[1:])
+    cmdline = cmd + " " + newargs
+    if len(cmdline) > 16 * 1024:
+        with open(filename, 'w') as f:
+            f.write(' '.join(args[1:]).replace('\\', '/'))
+        cmdline = cmd + " @" + filename
+    proc = subprocess.Popen(cmdline, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, shell=False, env=e)
+    data, err = proc.communicate()
+    rv = proc.wait()
+    if err:
+        sys.stderr.write(err.decode('utf-8', errors='replace') if isinstance(err, bytes) else str(err))
+    if data:
+        sys.stdout.write(data.decode('utf-8', errors='replace') if isinstance(data, bytes) else str(data))
+    if os.path.isfile(filename):
+        os.remove(filename)
+    return rv
+
+if platform.system() == 'Windows':
+    env['SPAWN'] = ourspawn
+
+env.VariantDir('build/libs', '../libs', duplicate=0)
+objs.extend(SConscript('../libs/SConscript', variant_dir='build/libs', duplicate=0))
+
+env.VariantDir('build/libraries/HAL_Drivers', '../libraries/HAL_Drivers', duplicate=0)
+env.VariantDir('build/libraries/components', '../libraries/components', duplicate=0)
+env.VariantDir('build/libraries/Common/board', '../libraries/Common/board', duplicate=0)
+
+objs.extend(SConscript('../libraries/HAL_Drivers/SConscript', variant_dir='build/libraries/HAL_Drivers', duplicate=0))
+objs.extend(SConscript('../libraries/components/Infineon_cmsis-latest/SConscript', variant_dir='build/libraries/components/Infineon_cmsis-latest', duplicate=0))
+objs.extend(SConscript('../libraries/components/Infineon_core-lib-latest/SConscript', variant_dir='build/libraries/components/Infineon_core-lib-latest', duplicate=0))
+objs.extend(SConscript('../libraries/components/mtb-device-support-pse8xxgp/hal/SConscript', variant_dir='build/libraries/components/mtb-device-support-pse8xxgp/hal', duplicate=0))
+objs.extend(SConscript('../libraries/components/mtb-device-support-pse8xxgp/pdl/SConscript', variant_dir='build/libraries/components/mtb-device-support-pse8xxgp/pdl', duplicate=0))
+objs.extend(SConscript('../libraries/components/async-transfer/SConscript', variant_dir='build/libraries/components/async-transfer', duplicate=0))
+objs.extend(SConscript('../libraries/components/mtb-device-support-pse8xxgp/device-utils/syspm/SConscript', variant_dir='build/libraries/components/mtb-device-support-pse8xxgp/device-utils/syspm', duplicate=0))
+objs.extend(SConscript('../libraries/components/serial-memory/SConscript', variant_dir='build/libraries/components/serial-memory', duplicate=0))
+objs.extend(SConscript('../libraries/components/Infineon_retarget-io-latest/SConscript', variant_dir='build/libraries/components/Infineon_retarget-io-latest', duplicate=0))
+objs.extend(SConscript('../libraries/components/mtb-srf/SConscript', variant_dir='build/libraries/components/mtb-srf', duplicate=0))
+objs.extend(SConscript('../libraries/components/mtb-ipc/SConscript', variant_dir='build/libraries/components/mtb-ipc', duplicate=0))
+objs.extend(SConscript('../libraries/Common/board/SConscript', variant_dir='build/libraries/Common/board', duplicate=0))
+
+DoBuilding(TARGET, objs)
+
+DEBUG_DIR = 'build'
+if not os.path.exists(DEBUG_DIR):
+    os.makedirs(DEBUG_DIR)
+
+hex_file = env.Command(DEBUG_DIR + '/rtthread_app.hex', TARGET, OBJCOPY + ' -O ihex $SOURCE $TARGET')
+
+if platform.system() == 'Windows':
+    EDGEPROTECTTOOLS = os.path.join(WORKSPACE_ROOT, 'tools', 'edgeprotecttools', 'bin', 'edgeprotecttools.exe')
+    BOOT_CONFIG = os.path.join(SDK_ROOT, 'config', 'boot_dualcore_scons.json')
+    SIGNED_HEX = os.path.join(WORKSPACE_ROOT, 'tools', 'edgeprotecttools', 'cm33_s_signed_fw', 'proj_cm33_s_signed.hex')
+    if os.path.exists(EDGEPROTECTTOOLS) and os.path.exists(BOOT_CONFIG) and os.path.exists(SIGNED_HEX):
+        parent_dbg = os.path.join(WORKSPACE_ROOT, 'Debug')
+        if not os.path.exists(parent_dbg):
+            os.makedirs(parent_dbg)
+        combined_target = env.Command(
+            '../Debug/cm33_combined.hex',
+            [hex_file, BOOT_CONFIG],
+            '"' + EDGEPROTECTTOOLS + '" run-config -i "' + BOOT_CONFIG + '"'
+        )
+        env.AlwaysBuild(combined_target)
+        Default(combined_target)

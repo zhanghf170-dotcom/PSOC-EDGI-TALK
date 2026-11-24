@@ -1,0 +1,4 @@
+* text=auto
+*.rgb565 binary
+*.gif binary
+*.wav binary

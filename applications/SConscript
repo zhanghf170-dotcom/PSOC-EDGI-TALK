@@ -1,0 +1,51 @@
+import rtconfig
+from building import *
+import os
+Import('env')
+
+cwd  = GetCurrentDir()
+ports_root = os.path.abspath(os.path.join(cwd, '..', 'libraries', 'Common', 'board', 'ports')).replace('\\', '/')
+common_root = os.path.abspath(os.path.join(cwd, '..', 'libraries', 'Common')).replace('\\', '/')
+hal_root = os.path.abspath(os.path.join(cwd, '..', 'libraries', 'HAL_Drivers')).replace('\\', '/')
+usb_port = ports_root + '/usb'
+path = [
+    cwd,
+    usb_port,
+    hal_root,
+    common_root + '/deepcraft_ai/include',
+    cwd + '/../packages/wavplayer-latest/inc',
+    cwd + '/../packages/aht10-latest/inc',
+]
+gallery_assets = [('photos.rgb565', 'gallery_photos'),
+                  ('thumbnails.rgb565', 'gallery_thumbnails'),
+                  ('blink.gif', 'gallery_blink_gif')]
+src = Glob('*.c', exclude=['cockpit_alarm_data.c', 'watch_wallpaper_data.c']
+           + [name + '.c' for _, name in gallery_assets])
+
+def embed_asset(target, source, env):
+    name = env['ASSET_NAME']
+    with open(str(source[0]), 'rb') as asset, open(str(target[0]), 'w') as output:
+        data = asset.read()
+        output.write('#include <stddef.h>\nconst unsigned char %s[] __attribute__((aligned(64))) = {\n' % name)
+        for offset in range(0, len(data), 16):
+            output.write('    ' + ', '.join(str(byte) for byte in data[offset:offset + 16]) + ',\n')
+        output.write('};\nconst size_t %s_size = sizeof(%s);\n' % (name, name))
+
+src += env.Command('#build/applications/cockpit_alarm_data.c',
+                   '#resources/cockpit_alarm.wav', embed_asset, ASSET_NAME='cockpit_alarm_wav')
+media_dir = os.environ.get('EDGI_MEDIA_DIR')
+media_root = Dir(os.path.abspath(media_dir)) if media_dir else Dir('#resources')
+src += env.Command('#build/applications/watch_wallpaper_data.c',
+                   media_root.File('watch_wallpaper.rgb565'), embed_asset, ASSET_NAME='watch_wallpaper_rgb565')
+for file, name in gallery_assets:
+    src += env.Command('#build/applications/' + name + '.c',
+                       media_root.File('gallery/' + file), embed_asset, ASSET_NAME=name)
+
+group = DefineGroup('Applications', src, depend = [''], CPPPATH = path)
+
+list = os.listdir(cwd)
+for item in list:
+    if os.path.isfile(os.path.join(cwd, item, 'SConscript')):
+        group = group + SConscript(os.path.join(item, 'SConscript'))
+
+Return('group')

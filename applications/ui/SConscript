@@ -1,0 +1,20 @@
+import os
+import rtconfig
+from building import *
+
+cwd = GetCurrentDir()
+proj_root = os.path.abspath(os.path.join(cwd, '..', '..')).replace('\\', '/')
+
+src = Glob('*.c')
+path = [
+    cwd,
+    proj_root + '/applications',
+    proj_root + '/libraries/Common/board/ports/usb',
+    proj_root + '/libraries/Common/board/ports/lvgl',
+    proj_root + '/libraries/Common/deepcraft_ai/include',
+    proj_root + '/libraries/HAL_Drivers',
+    proj_root + '/libraries/components/lvgl_9.2.0',
+]
+
+group = DefineGroup('CockpitUI', src, depend=['BSP_USING_LVGL'], CPPPATH=path)
+Return('group')
