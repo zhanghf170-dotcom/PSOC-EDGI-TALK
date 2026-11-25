@@ -35,7 +35,8 @@
 #define CORE_NAME_CM55_0 1
 #define CYBSP_MCUBOOT_HEADER_SIZE 0x400
 #define CY_APPNAME_proj_cm55
-#define CY_ML_ARENA_MEM .cy_socmem_data
+#define CY_ML_ARENA_MEM .cy_ml_arena_fast_data
+#define CY_ML_WORKING_MEM .cy_ml_arena_fast_data
 #define CY_ML_MODEL_MEM .cy_socmem_data
 #define CY_PDL_FLASH_BOOT
 #define CY_RETARGET_IO_CONVERT_LF_TO_CRLF

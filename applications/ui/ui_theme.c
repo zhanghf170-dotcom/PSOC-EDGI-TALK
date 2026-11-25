@@ -13,7 +13,22 @@ lv_style_t g_st_btn_primary;
 lv_style_t g_st_btn_danger;
 lv_style_t g_st_btn_ghost;
 
+extern const unsigned char xiaozhi_zh_ttf[];
+extern const size_t xiaozhi_zh_ttf_size;
+
+static lv_font_t *g_font_zh_full = NULL;
+static lv_font_t *g_font_zh_small = NULL;
 static bool g_theme_inited = false;
+
+const lv_font_t *ui_font_zh_full(void)
+{
+    return (g_font_zh_full != NULL) ? g_font_zh_full : UI_FONT_ZH;
+}
+
+const lv_font_t *ui_font_zh_small(void)
+{
+    return (g_font_zh_small != NULL) ? g_font_zh_small : UI_FONT_ZH;
+}
 
 void ui_set_label_text(lv_obj_t *label, const char *text)
 {
@@ -82,16 +97,33 @@ void ui_theme_init(void)
     lv_style_set_text_color(&g_st_btn_ghost, UI_COL_TEXT);
     lv_style_set_radius(&g_st_btn_ghost, 12);
 
+#if LV_USE_TINY_TTF
+    if (xiaozhi_zh_ttf_size != 0U)
+    {
+        g_font_zh_full = lv_tiny_ttf_create_data(xiaozhi_zh_ttf, xiaozhi_zh_ttf_size, 20);
+        g_font_zh_small = lv_tiny_ttf_create_data(xiaozhi_zh_ttf, xiaozhi_zh_ttf_size, 16);
+    }
+    if (g_font_zh_full != NULL)
+    {
+        g_font_zh_full->fallback = &lv_font_montserrat_20;
+    }
+    if (g_font_zh_small != NULL)
+    {
+        g_font_zh_small->fallback = &lv_font_montserrat_16;
+    }
+#endif
+
     g_theme_inited = true;
 }
 
 void ui_create_chrome(lv_obj_t *scr, const char *title,
                       ui_screen_id_t active_tab, ui_chrome_t *refs)
 {
-    static const struct { ui_screen_id_t page; const char *label; } tabs[] = {
-        {UI_SCR_HOME, LV_SYMBOL_HOME " 表盘"},
-        {UI_SCR_APPS, LV_SYMBOL_LIST " 应用"},
-        {UI_SCR_FATIGUE, LV_SYMBOL_EYE_OPEN " 监测"},
+    static const struct { ui_screen_id_t page; const char *label; bool use_full_font; } tabs[] = {
+        {UI_SCR_HOME,    LV_SYMBOL_HOME " 表盘", false},
+        {UI_SCR_APPS,    LV_SYMBOL_LIST " 应用", false},
+        {UI_SCR_XIAOZHI, LV_SYMBOL_AUDIO " 小智", true},
+        {UI_SCR_FATIGUE, LV_SYMBOL_EYE_OPEN " 监测", false},
     };
 
     lv_obj_add_style(scr, &g_st_screen, 0);
@@ -116,7 +148,14 @@ void ui_create_chrome(lv_obj_t *scr, const char *title,
     lv_obj_t *lbl_title = lv_label_create(top);
     lv_label_set_text(lbl_title, title ? title : "COCKPIT");
     lv_obj_set_style_text_color(lbl_title, UI_COL_TEXT, 0);
-    lv_obj_set_style_text_font(lbl_title, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(lbl_title,
+                               (active_tab == UI_SCR_XIAOZHI ||
+                                active_tab == UI_SCR_WEATHER ||
+                                active_tab == UI_SCR_SYSTEM ||
+                                active_tab == UI_SCR_CLOCK_TOOLS ||
+                                active_tab == UI_SCR_FATIGUE)
+                                   ? ui_font_zh_full() : UI_FONT_ZH,
+                               0);
 
     lv_obj_t *right_grp = lv_obj_create(top);
     lv_obj_set_size(right_grp, 180, LV_SIZE_CONTENT);
@@ -178,11 +217,13 @@ void ui_create_chrome(lv_obj_t *scr, const char *title,
     for (size_t i = 0; i < sizeof(tabs) / sizeof(tabs[0]); i++)
     {
         bool is_active = active_tab == tabs[i].page;
+        lv_color_t active_bg = (tabs[i].page == UI_SCR_XIAOZHI) ? UI_COL_GEMINI_VIOLET : UI_COL_CYAN;
+        lv_color_t active_fg = (tabs[i].page == UI_SCR_XIAOZHI) ? UI_COL_TEXT : lv_color_hex(0x06101F);
         lv_obj_t *btn = lv_button_create(nav);
         lv_obj_set_flex_grow(btn, 1);
         lv_obj_set_height(btn, 46);
         lv_obj_set_style_radius(btn, 12, 0);
-        lv_obj_set_style_bg_color(btn, is_active ? UI_COL_CYAN : UI_COL_CARD, 0);
+        lv_obj_set_style_bg_color(btn, is_active ? active_bg : UI_COL_CARD, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(btn, is_active ? 0 : 1, 0);
         lv_obj_set_style_border_color(btn, UI_COL_BORDER, 0);
@@ -191,8 +232,8 @@ void ui_create_chrome(lv_obj_t *scr, const char *title,
 
         lv_obj_t *blbl = lv_label_create(btn);
         lv_label_set_text(blbl, tabs[i].label);
-        lv_obj_set_style_text_font(blbl, UI_FONT_ZH, 0);
-        lv_obj_set_style_text_color(blbl, is_active ? lv_color_hex(0x06101F) : UI_COL_MUTED, 0);
+        lv_obj_set_style_text_font(blbl, tabs[i].use_full_font ? ui_font_zh_full() : UI_FONT_ZH, 0);
+        lv_obj_set_style_text_color(blbl, is_active ? active_fg : UI_COL_MUTED, 0);
         lv_obj_center(blbl);
     }
 

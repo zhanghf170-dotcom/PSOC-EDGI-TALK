@@ -68,10 +68,12 @@ uint32_t lcd_get_scanout_count(void)
 #define DEFAULT_GPU_CMD_BUFFER_SIZE         ((64U) * (512))
 #define VG_PARAMS_POS                       (0UL)
 #define GPU_MEM_BASE                        (0x0U)
+#define VGLITE_HEAP_EXTRA_SIZE  (64U * 1024U)
 #define VGLITE_HEAP_SIZE        (((DEFAULT_GPU_CMD_BUFFER_SIZE) * \
                                  (APP_BUFFER_COUNT)) + \
                                  ((GPU_TESSELLATION_BUFFER_SIZE) * \
-                                 (APP_BUFFER_COUNT)))
+                                 (APP_BUFFER_COUNT)) + \
+                                 (VGLITE_HEAP_EXTRA_SIZE))
 CY_SECTION(".cy_gpu_buf") CY_ALIGN(64) uint8_t contiguous_mem[VGLITE_HEAP_SIZE] = { 0xFF };
 volatile void *vglite_heap_base = &contiguous_mem;
 

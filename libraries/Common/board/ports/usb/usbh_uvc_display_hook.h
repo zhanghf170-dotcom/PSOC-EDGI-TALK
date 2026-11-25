@@ -25,8 +25,10 @@ typedef void (*uvc_display_overlay_cb_t)(const uvc_display_overlay_info_t *info,
 void uvc_display_set_overlay_callback(uvc_display_overlay_cb_t cb, void *user_ctx);
 
 const uint16_t *uvc_display_get_stage_rgb565(uint16_t *w, uint16_t *h, uint32_t *seq);
+rt_bool_t uvc_display_copy_stage_rgb565(uint16_t *dst, size_t capacity, uint16_t *w, uint16_t *h);
 void uvc_display_lock_stage(void);
 void uvc_display_unlock_stage(void);
+void uvc_display_release_scratch(void);
 
 int uvc_app_start(uint8_t fmt, uint16_t w, uint16_t h);
 int uvc_app_start_preview(void);
@@ -35,6 +37,9 @@ int uvc_app_stop(void);
 rt_bool_t uvc_app_is_running(void);
 rt_bool_t uvc_app_is_preview(void);
 rt_bool_t uvc_app_preview_frame_ready(void);
+rt_bool_t uvc_app_has_frame(void);
+const char *uvc_app_camera_state(void);
+uint32_t uvc_app_frame_count(void);
 void uvc_app_get_fps(uint32_t *cam_fps, uint32_t *disp_fps, uint32_t *drop_cnt);
 
 #ifdef __cplusplus

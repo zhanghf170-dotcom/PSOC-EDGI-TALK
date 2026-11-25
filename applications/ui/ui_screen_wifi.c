@@ -204,7 +204,7 @@ lv_obj_t *ui_screen_wifi_create(void)
     lv_obj_set_style_text_color(g_lbl_conn_state, UI_COL_CYAN, 0);
 
     g_lbl_url = lv_label_create(scard);
-    lv_label_set_text(g_lbl_url, "MJPEG URL: http://0.0.0.0:8080/stream");
+    lv_label_set_text(g_lbl_url, "HTTP: http://0.0.0.0:8080/stream\nRTSP: rtsp://0.0.0.0:8554/camera");
     lv_obj_set_style_text_font(g_lbl_url, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(g_lbl_url, UI_COL_TEXT, 0);
 
@@ -465,7 +465,8 @@ void ui_screen_wifi_update(void)
     lv_obj_set_style_text_color(g_lbl_conn_state,
                                 wst.ready ? UI_COL_GREEN : (wst.connected ? UI_COL_AMBER : UI_COL_CYAN), 0);
 
-    lv_label_set_text_fmt(g_lbl_url, "HTTP: http://%s:8080/stream", wst.ip_str);
+    lv_label_set_text_fmt(g_lbl_url, "HTTP: http://%s:%u/stream\nRTSP: rtsp://%s:%u/camera",
+                          wst.ip_str, WIFI_STREAM_HTTP_PORT, wst.ip_str, WIFI_STREAM_RTSP_PORT);
     lv_label_set_text_fmt(g_lbl_stream_stats,
                           "Clients: %d | Stream: %lu fps (%lu kbps) | Relay: %s:%u (#%lu)",
                           wst.http_clients, (unsigned long)wst.stream_fps, (unsigned long)wst.tx_kbps,

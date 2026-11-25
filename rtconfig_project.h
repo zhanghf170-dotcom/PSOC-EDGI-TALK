@@ -20,4 +20,20 @@
 #define BSP_SOFT_I2C2_SDA_PIN 106
 #endif
 
+#ifndef WIFI_DEFAULT_SSID
+#define WIFI_DEFAULT_SSID ""
+#endif
+#ifndef WIFI_DEFAULT_PWD
+#define WIFI_DEFAULT_PWD ""
+#endif
+
+/* Keep full 16 KB TLS RX buffer for server cert chains, trim TX buffer to 8 KB
+ * (still above MCP tools/list max 7.5 KB) to save 8 KB RAM per TLS session. */
+#ifndef MBEDTLS_SSL_IN_CONTENT_LEN
+#define MBEDTLS_SSL_IN_CONTENT_LEN 16384
+#endif
+#ifndef MBEDTLS_SSL_OUT_CONTENT_LEN
+#define MBEDTLS_SSL_OUT_CONTENT_LEN 8192
+#endif
+
 #endif /* RTCONFIG_PROJECT_H__ */

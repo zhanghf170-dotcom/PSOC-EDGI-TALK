@@ -47,7 +47,8 @@ if PLATFORM == 'gcc':
     DEVICE = ' -mcpu=cortex-m55 -mthumb -mfpu=fpv5-d16 -march=armv8.1-m.main+fp.dp+mve --specs=nano.specs -mfloat-abi=hard -ffunction-sections -fdata-sections -nostartfiles'
     CFLAGS = DEVICE + ' -g -Wall -pipe'
     AFLAGS = ' -c' + DEVICE + ' -x assembler-with-cpp -Wa,-mimplicit-it=thumb '
-    LFLAGS = DEVICE + ' -flto -Wl,--gc-sections,-Map=rtthread.map,-cref,-u,Reset_Handler -T board/linker_scripts/link.ld'
+    LFLAGS = DEVICE + ' -flto -Wl,--gc-sections,-Map=rtthread.map,-cref,-u,Reset_Handler'
+    LFLAGS += ' -T board/linker_scripts/link.ld'
 
     CPATH = ''
     LPATH = ''
@@ -58,7 +59,7 @@ if PLATFORM == 'gcc':
     else:
         CFLAGS += ' -O2'
 
-    CXXFLAGS = CFLAGS 
+    CXXFLAGS = CFLAGS + ' -std=c++17'
 
     POST_ACTION = 'python -c "import os,shutil; os.makedirs(\'Debug\') if not os.path.exists(\'Debug\') else None; shutil.copy(\'rt-thread.elf\',\'Debug/rtthread.elf\')"\n' + OBJCPY + ' -O ihex $TARGET Debug/rtthread.hex\n' + SIZE + ' $TARGET \n'
 

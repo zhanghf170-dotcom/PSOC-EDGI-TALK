@@ -26,14 +26,14 @@ static void board_mpu_optimize(void)
      *   - 0x26000000..0x2636FFFF (m55_code_secondary + m55_data_secondary): WB/WA cacheable via PRIVDEFENA
      *   - 0x26370000..0x263AFFFF (m33_m55_shared / UVC DMA): Non-Cacheable
      *   - 0x263B0000..0x264FFFFF (gfx_mem): Non-Cacheable
-     *   - 0x64200000..0x643FFFFF (m55_hyperram heap): WB/WA cacheable via PRIVDEFENA
-     *   - 0x64400000..0x64FFFFFF (m33_m55_shared_hyperram): Non-Cacheable
+     *   - 0x64200000..0x645FFFFF (m55_hyperram heap): WB/WA cacheable via PRIVDEFENA
+     *   - 0x64600000..0x64FFFFFF (m33_m55_shared_hyperram): Non-Cacheable
      */
     static const cy_stc_mpu_config_t mpu_opt_cfg[4] =
     {
         {
             .reg_num = 0U,
-            .base_addr = 0x64400000U,
+            .base_addr = 0x64600000U,
             .end_addr = 0x64FFFFFFU,
             .writable = true,
             .require_privileged = false,

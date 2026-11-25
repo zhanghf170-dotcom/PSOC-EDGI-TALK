@@ -10,14 +10,22 @@
 static ui_chrome_t g_chrome;
 static lv_obj_t *g_btn_toggle;
 static lv_obj_t *g_lbl_toggle;
+static lv_obj_t *g_btn_mode_fatigue;
+static lv_obj_t *g_btn_mode_ball;
+static lv_obj_t *g_lbl_mode_fatigue;
+static lv_obj_t *g_lbl_mode_ball;
 static lv_obj_t *g_cam_frame_box;
 static lv_obj_t *g_cam_img;
 static lv_obj_t *g_lbl_cam_hint;
 static lv_obj_t *g_banner_danger;
 static lv_obj_t *g_bar_risk;
 static lv_obj_t *g_bar_hold;
+static lv_obj_t *g_stats_card;
+static lv_obj_t *g_controls_card;
+static lv_obj_t *g_fatigue_controls;
 static lv_obj_t *g_lbl_risk;
 static lv_obj_t *g_lbl_metrics;
+static lv_obj_t *g_sl_thresh;
 static lv_obj_t *g_lbl_thresh_val;
 static lv_obj_t *g_lbl_hold_val;
 static lv_obj_t *g_lbl_vol_val;
@@ -26,6 +34,8 @@ static lv_obj_t *g_lbl_logs;
 static uint32_t g_last_cam_seq = 0U;
 static uint32_t g_last_log_danger_cnt = 0xFFFFFFFFU;
 static uint32_t g_last_metrics_update;
+static uvc_ai_mode_t g_ui_synced_mode = (uvc_ai_mode_t)0xFF;
+static void fatigue_refresh_logs(void);
 
 static lv_image_dsc_t g_cam_img_dsc = {
     .header = {
@@ -66,8 +76,73 @@ static void fatigue_snap_cb(lv_event_t *e)
 static void fatigue_slider_thresh_cb(lv_event_t *e)
 {
     int v = lv_slider_get_value(lv_event_get_target(e));
-    alert_set_threshold((float)v / 100.0f);
-    lv_label_set_text_fmt(g_lbl_thresh_val, "Thresh: %d%%", v);
+    if (uvc_ai_app_get_mode() == UVC_AI_MODE_STEEL_BALL)
+    {
+        uvc_ai_set_conf_threshold((float)v / 100.0f);
+        lv_label_set_text_fmt(g_lbl_thresh_val, "Conf: %d%%", v);
+    }
+    else
+    {
+        alert_set_threshold((float)v / 100.0f);
+        lv_label_set_text_fmt(g_lbl_thresh_val, "Thresh: %d%%", v);
+    }
+}
+
+static void fatigue_sync_mode_widgets(uvc_ai_mode_t mode)
+{
+    if (mode == g_ui_synced_mode) return;
+    g_ui_synced_mode = mode;
+
+    bool is_ball = (mode == UVC_AI_MODE_STEEL_BALL);
+    if (is_ball)
+    {
+        lv_obj_add_flag(g_banner_danger, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_bar_hold, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_fatigue_controls, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_obj_remove_flag(g_bar_hold, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(g_fatigue_controls, LV_OBJ_FLAG_HIDDEN);
+        fatigue_refresh_logs();
+    }
+    lv_obj_set_height(g_stats_card, is_ball ? 80 : 102);
+    lv_obj_set_height(g_controls_card, is_ball ? 58 : 250);
+    if (g_chrome.lbl_title != NULL)
+        ui_set_label_text(g_chrome.lbl_title, is_ball ? "钢球监测" : "疲劳监测");
+
+    if (g_btn_mode_fatigue != NULL && g_btn_mode_ball != NULL)
+    {
+        lv_obj_set_style_bg_color(g_btn_mode_fatigue, is_ball ? UI_COL_CARD : UI_COL_CYAN, LV_PART_MAIN);
+        lv_obj_set_style_text_color(g_lbl_mode_fatigue, is_ball ? UI_COL_MUTED : lv_color_hex(0x06101F), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(g_btn_mode_ball, is_ball ? UI_COL_GREEN : UI_COL_CARD, LV_PART_MAIN);
+        lv_obj_set_style_text_color(g_lbl_mode_ball, is_ball ? lv_color_hex(0x06101F) : UI_COL_MUTED, LV_PART_MAIN);
+    }
+
+    if (g_sl_thresh != NULL && g_lbl_thresh_val != NULL)
+    {
+        if (is_ball)
+        {
+            int v = (int)(uvc_ai_get_conf_threshold() * 100.0f);
+            lv_slider_set_range(g_sl_thresh, 20, 95);
+            lv_slider_set_value(g_sl_thresh, v, LV_ANIM_OFF);
+            lv_label_set_text_fmt(g_lbl_thresh_val, "Conf: %d%%", v);
+        }
+        else
+        {
+            int v = (int)(alert_get_threshold() * 100.0f);
+            lv_slider_set_range(g_sl_thresh, 50, 95);
+            lv_slider_set_value(g_sl_thresh, v, LV_ANIM_OFF);
+            lv_label_set_text_fmt(g_lbl_thresh_val, "Thresh: %d%%", v);
+        }
+    }
+}
+
+static void fatigue_mode_btn_cb(lv_event_t *e)
+{
+    uvc_ai_mode_t m = (uvc_ai_mode_t)(intptr_t)lv_event_get_user_data(e);
+    (void)uvc_ai_app_set_mode(m);
+    fatigue_sync_mode_widgets(uvc_ai_app_get_mode());
 }
 
 static void fatigue_slider_hold_cb(lv_event_t *e)
@@ -172,6 +247,36 @@ lv_obj_t *ui_screen_fatigue_create(void)
     lv_label_set_text(l_snap, LV_SYMBOL_IMAGE " Snap");
     lv_obj_center(l_snap);
 
+    /* Dual-Model Switcher Row: Fatigue vs Steel Ball */
+    lv_obj_t *mbar = lv_obj_create(body);
+    lv_obj_set_size(mbar, 456, 38);
+    lv_obj_set_style_bg_opa(mbar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mbar, 0, 0);
+    lv_obj_set_style_pad_all(mbar, 0, 0);
+    lv_obj_set_style_pad_column(mbar, 8, 0);
+    lv_obj_remove_flag(mbar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(mbar, LV_FLEX_FLOW_ROW);
+
+    g_btn_mode_fatigue = lv_button_create(mbar);
+    lv_obj_add_style(g_btn_mode_fatigue, &g_st_btn_ghost, 0);
+    lv_obj_set_flex_grow(g_btn_mode_fatigue, 1);
+    lv_obj_set_height(g_btn_mode_fatigue, 36);
+    lv_obj_add_event_cb(g_btn_mode_fatigue, fatigue_mode_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)UVC_AI_MODE_FATIGUE);
+    g_lbl_mode_fatigue = lv_label_create(g_btn_mode_fatigue);
+    lv_label_set_text(g_lbl_mode_fatigue, "疲劳监测");
+    lv_obj_set_style_text_font(g_lbl_mode_fatigue, ui_font_zh_full(), 0);
+    lv_obj_center(g_lbl_mode_fatigue);
+
+    g_btn_mode_ball = lv_button_create(mbar);
+    lv_obj_add_style(g_btn_mode_ball, &g_st_btn_ghost, 0);
+    lv_obj_set_flex_grow(g_btn_mode_ball, 1);
+    lv_obj_set_height(g_btn_mode_ball, 36);
+    lv_obj_add_event_cb(g_btn_mode_ball, fatigue_mode_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)UVC_AI_MODE_STEEL_BALL);
+    g_lbl_mode_ball = lv_label_create(g_btn_mode_ball);
+    lv_label_set_text(g_lbl_mode_ball, "钢球监测");
+    lv_obj_set_style_text_font(g_lbl_mode_ball, ui_font_zh_full(), 0);
+    lv_obj_center(g_lbl_mode_ball);
+
     /* Camera Viewport Card (440x330 scaled from 320x240 RGB565 Non-Cacheable stage) */
     g_cam_frame_box = lv_obj_create(body);
     lv_obj_set_size(g_cam_frame_box, 456, 342);
@@ -219,6 +324,7 @@ lv_obj_t *ui_screen_fatigue_create(void)
 
     /* Risk Telemetry & Persistence Meter Card */
     lv_obj_t *tcard = lv_obj_create(body);
+    g_stats_card = tcard;
     lv_obj_add_style(tcard, &g_st_card, 0);
     lv_obj_set_size(tcard, 456, 102);
     lv_obj_remove_flag(tcard, LV_OBJ_FLAG_SCROLLABLE);
@@ -258,6 +364,7 @@ lv_obj_t *ui_screen_fatigue_create(void)
 
     /* Tuning Controls & Persistent SD Logs Card */
     lv_obj_t *ccard = lv_obj_create(body);
+    g_controls_card = ccard;
     lv_obj_add_style(ccard, &g_st_card, 0);
     lv_obj_set_size(ccard, 456, 250);
     lv_obj_remove_flag(ccard, LV_OBJ_FLAG_SCROLLABLE);
@@ -270,15 +377,24 @@ lv_obj_t *ui_screen_fatigue_create(void)
     char sbuf[32];
 
     rt_snprintf(sbuf, sizeof(sbuf), "Thresh: %d%%", init_th);
-    make_slider_row(ccard, sbuf, 50, 95, init_th, fatigue_slider_thresh_cb, &g_lbl_thresh_val);
+    g_sl_thresh = make_slider_row(ccard, sbuf, 50, 95, init_th, fatigue_slider_thresh_cb, &g_lbl_thresh_val);
+
+    g_fatigue_controls = lv_obj_create(ccard);
+    lv_obj_set_size(g_fatigue_controls, 430, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(g_fatigue_controls, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_fatigue_controls, 0, 0);
+    lv_obj_set_style_pad_all(g_fatigue_controls, 0, 0);
+    lv_obj_set_style_pad_row(g_fatigue_controls, 8, 0);
+    lv_obj_set_flex_flow(g_fatigue_controls, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(g_fatigue_controls, LV_OBJ_FLAG_SCROLLABLE);
 
     rt_snprintf(sbuf, sizeof(sbuf), "Hold: %.1fs", (double)(init_hd / 1000.0f));
-    make_slider_row(ccard, sbuf, 1000, 3000, init_hd, fatigue_slider_hold_cb, &g_lbl_hold_val);
+    make_slider_row(g_fatigue_controls, sbuf, 1000, 3000, init_hd, fatigue_slider_hold_cb, &g_lbl_hold_val);
 
     rt_snprintf(sbuf, sizeof(sbuf), "Vol: %d", init_vl);
-    make_slider_row(ccard, sbuf, 0, 99, init_vl, fatigue_slider_vol_cb, &g_lbl_vol_val);
+    make_slider_row(g_fatigue_controls, sbuf, 0, 99, init_vl, fatigue_slider_vol_cb, &g_lbl_vol_val);
 
-    lv_obj_t *lrow = lv_obj_create(ccard);
+    lv_obj_t *lrow = lv_obj_create(g_fatigue_controls);
     lv_obj_set_size(lrow, 430, 30);
     lv_obj_set_style_bg_opa(lrow, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(lrow, 0, 0);
@@ -312,20 +428,22 @@ lv_obj_t *ui_screen_fatigue_create(void)
     lv_obj_set_style_text_font(lc, &lv_font_montserrat_12, 0);
     lv_obj_center(lc);
 
-    g_lbl_logs = lv_label_create(ccard);
+    g_lbl_logs = lv_label_create(g_fatigue_controls);
     lv_obj_set_width(g_lbl_logs, 430);
     lv_obj_set_style_text_font(g_lbl_logs, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(g_lbl_logs, UI_COL_MUTED, 0);
     lv_label_set_long_mode(g_lbl_logs, LV_LABEL_LONG_WRAP);
-    fatigue_refresh_logs();
+    fatigue_sync_mode_widgets(uvc_ai_app_get_mode());
 
     return scr;
 }
 
 void ui_screen_fatigue_on_enter(void)
 {
+    fatigue_sync_mode_widgets(uvc_ai_app_get_mode());
     (void)uvc_app_start_monitor();
-    fatigue_refresh_logs();
+    if (uvc_ai_app_get_mode() == UVC_AI_MODE_FATIGUE)
+        fatigue_refresh_logs();
 }
 
 void ui_screen_fatigue_update(void)
@@ -339,10 +457,11 @@ void ui_screen_fatigue_update(void)
     ui_update_chrome(&g_chrome);
 
     uvc_ai_app_get_telemetry(&tel);
+    fatigue_sync_mode_widgets(tel.mode);
     uvc_app_get_fps(&cam_fps, &disp_fps, &drops);
     (void)uvc_display_get_stage_rgb565(&w, &h, &seq);
 
-    if (tel.running)
+    if (uvc_app_is_running())
     {
         if (!lv_color_eq(lv_obj_get_style_bg_color(g_btn_toggle, LV_PART_MAIN), UI_COL_RED))
         {
@@ -361,7 +480,7 @@ void ui_screen_fatigue_update(void)
         ui_set_label_text(g_lbl_toggle, LV_SYMBOL_PLAY " Start AI Cam");
     }
 
-    if (tel.running && seq > 0U)
+    if (uvc_app_has_frame() && seq > 0U)
     {
         lv_obj_add_flag(g_lbl_cam_hint, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(g_cam_img, LV_OBJ_FLAG_HIDDEN);
@@ -388,38 +507,58 @@ void ui_screen_fatigue_update(void)
     if (!lv_color_eq(lv_obj_get_style_border_color(g_cam_frame_box, LV_PART_MAIN), frame_color))
         lv_obj_set_style_border_color(g_cam_frame_box, frame_color, LV_PART_MAIN);
 
-    int conf_pct = (int)(tel.max_closed_conf * 100.0f);
+    int conf_pct = (int)(((tel.mode == UVC_AI_MODE_STEEL_BALL) ? tel.max_det_conf : tel.max_closed_conf) * 100.0f);
     if (conf_pct < 0) conf_pct = 0;
     if (conf_pct > 100) conf_pct = 100;
     lv_bar_set_value(g_bar_risk, conf_pct, LV_ANIM_OFF);
 
-    uint32_t hold_pct = (tel.persist_target_ms > 0U)
-                        ? ((tel.persist_ms * 100U) / tel.persist_target_ms)
-                        : 0U;
-    if (hold_pct > 100U) hold_pct = 100U;
-    lv_bar_set_value(g_bar_hold, (int32_t)hold_pct, LV_ANIM_OFF);
-
-    lv_color_t rc = (tel.risk_level >= 2U || tel.alert_active) ? UI_COL_RED
-                    : ((tel.risk_level == 1U) ? UI_COL_AMBER : UI_COL_GREEN);
-    const char *rtxt = (tel.alert_active || tel.risk_level >= 2U) ? "HIGH RISK"
-                       : ((tel.risk_level == 1U) ? "MID RISK" : "SAFE");
-    snprintf(text, sizeof(text), "%s  %d%%", rtxt, conf_pct);
-    ui_set_label_text(g_lbl_risk, text);
-    if (!lv_color_eq(lv_obj_get_style_text_color(g_lbl_risk, LV_PART_MAIN), rc))
+    if (tel.mode == UVC_AI_MODE_STEEL_BALL)
     {
-        lv_obj_set_style_text_color(g_lbl_risk, rc, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(g_bar_risk, rc, LV_PART_INDICATOR);
+        lv_color_t rc = (tel.det_count > 0U) ? UI_COL_GREEN : UI_COL_CYAN;
+        snprintf(text, sizeof(text), "BALLS: %u  MAX: %d%%", (unsigned)tel.det_count, conf_pct);
+        ui_set_label_text(g_lbl_risk, text);
+        if (!lv_color_eq(lv_obj_get_style_text_color(g_lbl_risk, LV_PART_MAIN), rc))
+        {
+            lv_obj_set_style_text_color(g_lbl_risk, rc, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(g_bar_risk, rc, LV_PART_INDICATOR);
+        }
+    }
+    else
+    {
+        uint32_t hold_pct = (tel.persist_target_ms > 0U)
+                            ? ((tel.persist_ms * 100U) / tel.persist_target_ms)
+                            : 0U;
+        if (hold_pct > 100U) hold_pct = 100U;
+        lv_bar_set_value(g_bar_hold, (int32_t)hold_pct, LV_ANIM_OFF);
+
+        lv_color_t rc = (tel.risk_level >= 2U || tel.alert_active) ? UI_COL_RED
+                        : ((tel.risk_level == 1U) ? UI_COL_AMBER : UI_COL_GREEN);
+        const char *rtxt = (tel.alert_active || tel.risk_level >= 2U) ? "HIGH RISK"
+                           : ((tel.risk_level == 1U) ? "MID RISK" : "SAFE");
+        snprintf(text, sizeof(text), "%s  %d%%", rtxt, conf_pct);
+        ui_set_label_text(g_lbl_risk, text);
+        if (!lv_color_eq(lv_obj_get_style_text_color(g_lbl_risk, LV_PART_MAIN), rc))
+        {
+            lv_obj_set_style_text_color(g_lbl_risk, rc, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(g_bar_risk, rc, LV_PART_INDICATOR);
+        }
     }
 
     if (lv_tick_elaps(g_last_metrics_update) >= 500U)
     {
         g_last_metrics_update = lv_tick_get();
-        snprintf(text, sizeof(text), "Inf: %.1f ms | Cam: %lu fps | Alerts: %lu",
-                 (double)tel.inference_ms, (unsigned long)cam_fps, (unsigned long)tel.danger_count);
+        if (tel.running && !tel.ai_ready)
+            snprintf(text, sizeof(text), "AI unavailable");
+        else if (tel.mode == UVC_AI_MODE_STEEL_BALL)
+            snprintf(text, sizeof(text), "Inf: %.1f ms | Cam: %lu fps",
+                     (double)tel.inference_ms, (unsigned long)cam_fps);
+        else
+            snprintf(text, sizeof(text), "Inf: %.1f ms | Cam: %lu fps | Alerts: %lu",
+                     (double)tel.inference_ms, (unsigned long)cam_fps, (unsigned long)tel.danger_count);
         ui_set_label_text(g_lbl_metrics, text);
     }
 
-    if (tel.danger_count != g_last_log_danger_cnt)
+    if (tel.mode == UVC_AI_MODE_FATIGUE && tel.danger_count != g_last_log_danger_cnt)
     {
         g_last_log_danger_cnt = tel.danger_count;
         fatigue_refresh_logs();

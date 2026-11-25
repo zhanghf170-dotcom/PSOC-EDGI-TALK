@@ -678,10 +678,10 @@ int usbh_deinitialize(uint8_t busid)
 int usbh_control_transfer(struct usbh_hubport *hport, struct usb_setup_packet *setup, uint8_t *buffer)
 {
     struct usbh_urb *urb;
-    volatile uint8_t retry = 3;
+    unsigned int retry = 0;
     int ret;
 
-    if (!hport || !setup) {
+    if (!hport || !setup || !hport->connected || !hport->mutex) {
         return -USB_ERR_INVAL;
     }
 
@@ -698,12 +698,13 @@ resubmit:
         ret = urb->actual_length;
     }
 
-    if (ret < 0 && (ret != -USB_ERR_TIMEOUT)) {
-        retry--;
-        if (retry > 0) {
-            USB_LOG_WRN("Control transfer failed, errorcode %d, retrying...\r\n", ret);
+    if (hport->connected &&
+        ((ret == -USB_ERR_NAK && retry < 10U) || (ret == -USB_ERR_IO && retry < 2U))) {
+        retry++;
+        /* A high-speed device may NAK while its control firmware is busy. */
+        usb_osal_msleep(5);
+        if (hport->connected)
             goto resubmit;
-        }
     }
 
     usb_osal_mutex_give(hport->mutex);

@@ -35,18 +35,16 @@
 
 /* SD Host timing parameters */
 #define CY_SDIO_MIN_FREQ_HZ         (400000U)       /* 400KHz for identification */
-#define CY_SDIO_DEFAULT_FREQ_HZ     (25000000U)     /* 25MHz default speed */
 #define CY_SDIO_MAX_FREQ_HZ         (50000000U)     /* 50MHz high speed */
 
 /* DMA and buffer configuration */
 #define CY_SDIO_ADMA_MAX_LEN        (0xFFFFU)       /* ADMA max length 64KB */
+#define CY_SDIO_INIT_BOUNCE_SIZE    (8U * 1024U)    /* Initial 8KB bounce buf; grows on demand */
 #define CY_SDIO_MAX_BLOCKS          (CY_SDIO_ADMA_MAX_LEN / 512U)
 #define CY_SDIO_BOUNCE_ALIGN        (32U)           /* DMA buffer alignment */
 #define CY_SDIO_BUFF_SIZE           (CY_SDIO_ADMA_MAX_LEN)
 
-/* Command timeout in milliseconds */
-#define CY_SDIO_CMD_TIMEOUT_MS      (5000U)
-#define CY_SDIO_DATA_TIMEOUT_MS     (30000U)
+#define CY_SDIO_CMD53_TIMEOUT_MS    (500U)
 
 /* Lock macros */
 #define CY_SDIO_LOCK(sdio)      rt_mutex_take(&(sdio)->mutex, RT_WAITING_FOREVER)
@@ -67,6 +65,10 @@ struct cy_pse_sdio
 {
     struct rt_mmcsd_host *host;         /* RT-Thread MMCSD host */
     struct rt_mutex mutex;              /* Access mutex */
+    struct rt_semaphore transfer_done;  /* CMD53 data completion */
+    volatile rt_bool_t cmd53_pending;
+    rt_uint32_t cmd53_completed;
+    rt_uint32_t cmd53_timeouts;
     rt_uint8_t *bounce_buf;             /* DMA bounce buffer */
     rt_size_t bounce_size;              /* Bounce buffer size */
     rt_uint8_t power_mode;              /* Current power mode */
@@ -85,6 +87,20 @@ struct cy_pse_sdio *sdio0;
 #ifdef BSP_USING_SDIO1
 struct cy_pse_sdio *sdio1;
 #endif /* #ifdef BSP_USING_SDIO1 */
+
+#if defined(RT_USING_FINSH) && defined(BSP_USING_SDIO0)
+static int sdio_status(void)
+{
+    if (!sdio0)
+        return -RT_ERROR;
+
+    rt_kprintf("SDIO0 cmd53=%u timeouts=%u bounce=%u clock=%u\n",
+               (unsigned int)sdio0->cmd53_completed, (unsigned int)sdio0->cmd53_timeouts,
+               (unsigned int)sdio0->bounce_size, (unsigned int)sdio0->current_freq);
+    return RT_EOK;
+}
+MSH_CMD_EXPORT(sdio_status, Show Wi-Fi SDIO transfer counters);
+#endif
 
 /**
  * @brief Convert RT-Thread response type to HAL response type
@@ -211,7 +227,7 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
     rt_uint8_t *user_buf = RT_NULL;
     rt_uint8_t *dma_buf = RT_NULL;
     rt_size_t total_bytes = 0;
-    rt_bool_t use_bounce = RT_FALSE;
+    rt_bool_t cmd53 = data && cmd->cmd_code == SD_IO_RW_EXTENDED;
 
     /* Clear auto cmd12 flag at start of each command */
     sdio->auto_cmd12_sent = RT_FALSE;
@@ -234,39 +250,38 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
 
     if (data)
     {
+        data->bytes_xfered = 0;
+        user_buf = (rt_uint8_t *)data->buf;
         total_bytes = (rt_size_t)data->blks * data->blksize;
-        if ((total_bytes == 0) || (total_bytes > CY_SDIO_ADMA_MAX_LEN))
+        if (!user_buf || total_bytes == 0 || total_bytes > CY_SDIO_ADMA_MAX_LEN)
         {
             LOG_E("invalid transfer size %d", total_bytes);
             err = -RT_EINVAL;
             goto exit;
         }
 
-        if (!sdio->bounce_buf || sdio->bounce_size < total_bytes)
+        if (sdio->bounce_size < total_bytes)
         {
+            rt_size_t capacity = total_bytes > CY_SDIO_INIT_BOUNCE_SIZE ?
+                                 total_bytes : CY_SDIO_INIT_BOUNCE_SIZE;
+            /* Cache invalidation rounds up to a full line after the payload. */
+            capacity = RT_ALIGN(capacity, CY_SDIO_BOUNCE_ALIGN);
+            rt_uint8_t *new_buf = rt_malloc_align(capacity, CY_SDIO_BOUNCE_ALIGN);
+            if (!new_buf)
+            {
+                LOG_E("alloc bounce %u fail", (unsigned int)capacity);
+                err = -RT_ENOMEM;
+                goto exit;
+            }
             if (sdio->bounce_buf)
             {
                 rt_free_align(sdio->bounce_buf);
             }
-            sdio->bounce_buf = rt_malloc_align(total_bytes, CY_SDIO_BOUNCE_ALIGN);
-            if (!sdio->bounce_buf)
-            {
-                LOG_E("alloc bounce %d fail", total_bytes);
-                err = -RT_ENOMEM;
-                goto exit;
-            }
-            sdio->bounce_size = total_bytes;
-        }
-
-        user_buf = (rt_uint8_t *)data->buf;
-        if (!user_buf)
-        {
-            err = -RT_EINVAL;
-            goto exit;
+            sdio->bounce_buf = new_buf;
+            sdio->bounce_size = capacity;
         }
 
         dma_buf = sdio->bounce_buf;
-        use_bounce = RT_TRUE;
 
         if (data->flags & DATA_DIR_WRITE)
         {
@@ -277,8 +292,6 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
         {
             CY_SDIO_DCACHE_INVALIDATE(dma_buf, total_bytes);
         }
-
-        data->bytes_xfered = 0;
 
         rt_memset(&data_cfg, 0, sizeof(data_cfg));
         data_cfg.data_ptr = (uint32_t *)dma_buf;
@@ -318,6 +331,13 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
     hal_cmd.enable_idx_check = cy_sdio_resp_need_idx(cmd->flags);
     hal_cmd.command_type = MTB_HAL_SDHC_CMD_NORMAL;
     hal_cmd.data_config = data ? &data_cfg : RT_NULL;
+
+    if (cmd53)
+    {
+        /* A short transfer can complete before the command response is read. */
+        rt_sem_trytake(&sdio->transfer_done);
+        sdio->cmd53_pending = RT_TRUE;
+    }
 
     /* Send command */
     result = mtb_hal_sdhc_send_cmd(sdio->hw_desc->sdhc_obj, &hal_cmd);
@@ -368,16 +388,35 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
     /* Wait for data transfer completion */
     if ((err == RT_EOK) && data)
     {
-        result = mtb_hal_sdhc_wait_transfer_complete(sdio->hw_desc->sdhc_obj);
-        if (CY_RSLT_SUCCESS != result)
+        if (cmd53)
+        {
+            err = rt_sem_take(&sdio->transfer_done, rt_tick_from_millisecond(CY_SDIO_CMD53_TIMEOUT_MS));
+            if (err != RT_EOK)
+            {
+                sdio->cmd53_pending = RT_FALSE;
+                sdio->cmd53_timeouts++;
+                LOG_W("CMD53 timeout arg=0x%08x bytes=%u normal=0x%04x state=0x%08x",
+                      (unsigned int)cmd->arg, (unsigned int)total_bytes,
+                      (unsigned int)Cy_SD_Host_GetNormalInterruptStatus(sdio->hw_desc->hw_base),
+                      (unsigned int)Cy_SD_Host_GetPresentState(sdio->hw_desc->hw_base));
+                goto exit_hw;
+            }
+        }
+        else if ((result = mtb_hal_sdhc_wait_transfer_complete(sdio->hw_desc->sdhc_obj)) != CY_RSLT_SUCCESS)
         {
             LOG_E("wait transfer complete fail: 0x%08x", (unsigned int)result);
             err = -RT_ERROR;
             goto exit_hw;
         }
 
+        if (mtb_hal_sdhc_get_last_command_errors(sdio->hw_desc->sdhc_obj) != MTB_HAL_SDHC_NO_ERR)
+            goto exit_hw;
+
+        if (cmd53)
+            sdio->cmd53_completed++;
+
         /* Copy data from bounce buffer for read operations */
-        if (use_bounce && (data->flags & DATA_DIR_READ))
+        if (data->flags & DATA_DIR_READ)
         {
             CY_SDIO_DCACHE_INVALIDATE(dma_buf, total_bytes);
             rt_memcpy(user_buf, dma_buf, total_bytes);
@@ -386,6 +425,8 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
     }
 
 exit_hw:
+    if (cmd53)
+        sdio->cmd53_pending = RT_FALSE;
     /* Check for hardware errors */
     {
         mtb_hal_sdhc_error_type_t hw_err = mtb_hal_sdhc_get_last_command_errors(sdio->hw_desc->sdhc_obj);
@@ -408,10 +449,9 @@ exit_hw:
             LOG_W("cmd %d arg 0x%08x flags 0x%08x hw_err 0x%04x",
                   cmd->cmd_code, cmd->arg, cmd->flags, (unsigned int)hw_err);
             mtb_hal_sdhc_clear_errors(sdio->hw_desc->sdhc_obj);
-
-            /* Reset command and data lines on error */
-            mtb_hal_sdhc_software_reset(sdio->hw_desc->sdhc_obj);
         }
+        if (hw_err != MTB_HAL_SDHC_NO_ERR || (cmd53 && err != RT_EOK))
+            mtb_hal_sdhc_software_reset(sdio->hw_desc->sdhc_obj);
     }
 
 exit:
@@ -678,13 +718,17 @@ bool Cy_SD_Host_IsCardConnected(SDHC_Type const *base)
     return true;
 }
 
-static void cy_sdio_card_irq_handler (struct cy_pse_sdio *sdio)
+static void cy_sdio_irq_handler(struct cy_pse_sdio *sdio)
 {
     uint32_t interruptStatus = Cy_SD_Host_GetNormalInterruptStatus(sdio->hw_desc->hw_base);
     uint32_t normalInterruptMask = Cy_SD_Host_GetNormalInterruptMask(sdio->hw_desc->hw_base);
 
-    /*  CY_SD_HOST_XFER_COMPLETE occured and appropriate bit in interrupt mask is enabled */
-    if (interruptStatus & normalInterruptMask & CY_SD_HOST_XFER_COMPLETE)
+    /* HAL disables the signal when it acknowledges completion, including an
+     * event that arrived after the initial status read. */
+    mtb_hal_sdhc_process_interrupt(sdio->hw_desc->sdhc_obj);
+    rt_bool_t transfer_complete = (normalInterruptMask & CY_SD_HOST_XFER_COMPLETE) &&
+        !(Cy_SD_Host_GetNormalInterruptMask(sdio->hw_desc->hw_base) & CY_SD_HOST_XFER_COMPLETE);
+    if (transfer_complete)
     {
         /* Transfer is no more active. If card interrupt was not yet enabled after it was disabled
          * in interrupt handler, enable it.
@@ -711,6 +755,12 @@ static void cy_sdio_card_irq_handler (struct cy_pse_sdio *sdio)
         /* Notify the upper layer about sdio card interrupt */
         sdio_irq_wakeup(sdio->host);
     }
+
+    if (transfer_complete && sdio->cmd53_pending)
+    {
+        sdio->cmd53_pending = RT_FALSE;
+        rt_sem_release(&sdio->transfer_done);
+    }
 }
 
 #ifdef BSP_USING_SDIO0
@@ -720,8 +770,7 @@ static void cy_sdio_card_irq_handler (struct cy_pse_sdio *sdio)
 static void cy_sdio0_isr(void)
 {
     rt_interrupt_enter();
-    cy_sdio_card_irq_handler(sdio0);
-    mtb_hal_sdhc_process_interrupt(sdio0->hw_desc->sdhc_obj);
+    cy_sdio_irq_handler(sdio0);
     rt_interrupt_leave();
 }
 #endif /* BSP_USING_SDIO0 */
@@ -733,8 +782,7 @@ static void cy_sdio0_isr(void)
 static void cy_sdio1_isr(void)
 {
     rt_interrupt_enter();
-    cy_sdio_card_irq_handler(sdio1);
-    mtb_hal_sdhc_process_interrupt(sdio1->hw_desc->sdhc_obj);
+    cy_sdio_irq_handler(sdio1);
     rt_interrupt_leave();
 }
 #endif /* BSP_USING_SDIO1 */
@@ -758,19 +806,9 @@ struct cy_pse_sdio *sdio_host_create(const struct cy_pse_sdio_hw_desc *hw_desc)
     /* Store hardware descriptor */
     sdio->hw_desc = hw_desc;
 
-    sdio->bounce_size = CY_SDIO_ADMA_MAX_LEN;
-    sdio->bounce_buf = rt_malloc_align(sdio->bounce_size, CY_SDIO_BOUNCE_ALIGN);
-    if (!sdio->bounce_buf)
-    {
-        rt_free(sdio);
-        LOG_E("alloc bounce buf fail");
-        return NULL;
-    }
-
     sdio->host = mmcsd_alloc_host();
     if (!sdio->host)
     {
-        rt_free_align(sdio->bounce_buf);
         rt_free(sdio);
         LOG_E("alloc host fail");
         return NULL;
@@ -778,6 +816,7 @@ struct cy_pse_sdio *sdio_host_create(const struct cy_pse_sdio_hw_desc *hw_desc)
 
     /* Initialize synchronization primitives */
     rt_mutex_init(&sdio->mutex, "sdio", RT_IPC_FLAG_PRIO);
+    rt_sem_init(&sdio->transfer_done, "sdxfer", 0, RT_IPC_FLAG_PRIO);
 
     /* Initialize PDL driver */
     pdl_status = Cy_SD_Host_Init(hw_desc->hw_base, hw_desc->pdl_config, &sdio->sdhc_host_context);
@@ -845,12 +884,10 @@ struct cy_pse_sdio *sdio_host_create(const struct cy_pse_sdio_hw_desc *hw_desc)
 
     LOG_I("SDIO driver initialized successfully");
 
-    /* Notify MMCSD core that host is ready */
-    mmcsd_change(sdio->host);
-
     return sdio;
 
 fail:
+    rt_sem_detach(&sdio->transfer_done);
     rt_mutex_detach(&sdio->mutex);
     if (sdio->bounce_buf)
     {
@@ -890,9 +927,6 @@ int rt_hw_sdio_init(void)
 
     if ((sysint_status = Cy_SysInt_Init(&sdhc0_isr_config, cy_sdio0_isr)) == CY_SYSINT_SUCCESS)
     {
-        /* Enable NVIC interrupt */
-        NVIC_EnableIRQ((IRQn_Type)sdhc0_isr_config.intrSrc);
-
         /* Create SDIO0 host */
         if ((sdio0 = sdio_host_create(&sdhc0_hw_desc)) == RT_NULL)
         {
@@ -903,6 +937,8 @@ int rt_hw_sdio_init(void)
         /* Configure default IO settings */
         sdio0->host->io_cfg.signal_voltage = MMCSD_SIGNAL_VOLTAGE_180;
         sdio0->en_auto_cmd12 = RT_FALSE;
+        NVIC_EnableIRQ((IRQn_Type)sdhc0_isr_config.intrSrc);
+        mmcsd_change(sdio0->host);
     }
     else
     {
@@ -933,9 +969,6 @@ int rt_hw_sdio_init(void)
 
     if ((sysint_status = Cy_SysInt_Init(&sdhc1_isr_config, cy_sdio1_isr)) == CY_SYSINT_SUCCESS)
     {
-        /* Enable NVIC interrupt */
-        NVIC_EnableIRQ((IRQn_Type)sdhc1_isr_config.intrSrc);
-
         /* Create SDIO1 host */
         if ((sdio1 = sdio_host_create(&sdhc1_hw_desc)) == RT_NULL)
         {
@@ -946,6 +979,8 @@ int rt_hw_sdio_init(void)
         /* Configure default IO settings */
         sdio1->host->io_cfg.signal_voltage = MMCSD_SIGNAL_VOLTAGE_330;
         sdio1->en_auto_cmd12 = RT_TRUE;
+        NVIC_EnableIRQ((IRQn_Type)sdhc1_isr_config.intrSrc);
+        mmcsd_change(sdio1->host);
     }
     else
     {

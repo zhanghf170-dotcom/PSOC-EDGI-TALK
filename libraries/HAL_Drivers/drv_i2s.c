@@ -148,7 +148,7 @@ void ifx_set_samplerate(struct rt_audio_configure audio_config)
                 Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 24U, 0U);
                 break;
             case 24000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 16U, 0U);
+                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 15U, 0U);
                 break;
             case 48000:
                 Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 8U, 0U);
@@ -525,7 +525,7 @@ int rt_hw_sound_init(void)
     snd_dev.tx_mq = rt_mq_create(
                         "sound_tx_mq",
                         sizeof(i2s_playback_q_data_t),
-                        sizeof(msg_pool),
+                        32,
                         RT_IPC_FLAG_FIFO);
 
     snd_dev.tx_sem = rt_sem_create("sound_tx_sem", 0, RT_IPC_FLAG_FIFO);

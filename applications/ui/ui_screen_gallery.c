@@ -1,15 +1,13 @@
 #include <rtthread.h>
+#include "board.h"
 #include "ui_manager.h"
-#include "src/libs/gif/gifdec.h"
 
 #define THUMB_W 192
 #define THUMB_H 224
-#define GIF_EDGE 320
 #define RGB565_BYTES(w, h) ((w) * (h) * 2U)
 
 extern const uint8_t gallery_photos[];
 extern const uint8_t gallery_thumbnails[];
-extern const uint8_t gallery_blink_gif[];
 
 #define PHOTO(w_, h_, offset) { \
     .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565, \
@@ -20,7 +18,6 @@ extern const uint8_t gallery_blink_gif[];
 static const lv_image_dsc_t photos[] = {
     PHOTO(256, 576, gallery_photos),
     PHOTO(448, 320, gallery_photos + RGB565_BYTES(256, 576)),
-    PHOTO(448, 528, gallery_photos + RGB565_BYTES(256, 576) + RGB565_BYTES(448, 320)),
 };
 
 static const struct {
@@ -29,8 +26,6 @@ static const struct {
 } items[] = {
     {"照片 1", PHOTO(THUMB_W, THUMB_H, gallery_thumbnails)},
     {"照片 2", PHOTO(THUMB_W, THUMB_H, gallery_thumbnails + RGB565_BYTES(THUMB_W, THUMB_H))},
-    {"照片 3", PHOTO(THUMB_W, THUMB_H, gallery_thumbnails + 2 * RGB565_BYTES(THUMB_W, THUMB_H))},
-    {"动图", PHOTO(THUMB_W, THUMB_H, gallery_thumbnails + 3 * RGB565_BYTES(THUMB_W, THUMB_H))},
 };
 
 #define ITEM_COUNT (sizeof(items) / sizeof(items[0]))
@@ -38,65 +33,13 @@ static const struct {
 static ui_chrome_t chrome;
 static lv_obj_t *grid, *detail, *image_box, *detail_image, *caption;
 static unsigned selected;
-static gd_GIF *animation;
-static lv_timer_t *animation_timer;
-static lv_image_dsc_t animation_frame = PHOTO(GIF_EDGE, GIF_EDGE, NULL);
 
-static void render_gif_frame(lv_timer_t *timer)
+static int gallery_status(void)
 {
-    if (gd_get_frame(animation) <= 0)
-    {
-        lv_timer_pause(timer);
-        return;
-    }
-    gd_render_frame(animation, animation->canvas);
-
-    const uint8_t *pixel = animation->canvas;
-    uint16_t *output = (uint16_t *)animation_frame.data;
-    for (unsigned i = 0; i < GIF_EDGE * GIF_EDGE; ++i, pixel += 4)
-        output[i] = (uint16_t)(((pixel[2] & 0xF8U) << 8) | ((pixel[1] & 0xFCU) << 3) | (pixel[0] >> 3));
-
-    lv_obj_invalidate(detail_image);
-    lv_timer_set_period(timer, LV_MAX(1U, animation->gce.delay) * 10U);
+    rt_kprintf("Gallery selected=%u items=%u\n", selected, (unsigned)ITEM_COUNT);
+    return 0;
 }
-
-static void close_animation(void)
-{
-    if (animation_timer != NULL)
-    {
-        lv_timer_delete(animation_timer);
-        animation_timer = NULL;
-    }
-    if (animation != NULL)
-    {
-        gd_close_gif(animation);
-        animation = NULL;
-    }
-    if (animation_frame.data != NULL)
-    {
-        lv_image_cache_drop(&animation_frame);
-        rt_free_align((void *)animation_frame.data);
-        animation_frame.data = NULL;
-    }
-}
-
-static bool open_animation(void)
-{
-    animation = gd_open_gif_data(gallery_blink_gif);
-    if (animation == NULL || animation->width != GIF_EDGE || animation->height != GIF_EDGE)
-        goto fail;
-    animation_frame.data = rt_malloc_align(animation_frame.data_size, LV_DRAW_BUF_ALIGN);
-    if (animation_frame.data == NULL)
-        goto fail;
-    animation_timer = lv_timer_create(render_gif_frame, 80, NULL);
-    if (animation_timer == NULL)
-        goto fail;
-    return true;
-
-fail:
-    close_animation();
-    return false;
-}
+MSH_CMD_EXPORT(gallery_status, Show gallery status);
 
 void ui_screen_gallery_open(unsigned index)
 {
@@ -104,31 +47,45 @@ void ui_screen_gallery_open(unsigned index)
         return;
 
     lv_image_set_src(detail_image, NULL);
-    close_animation();
     selected = index;
-    bool play = index >= sizeof(photos) / sizeof(photos[0]) && open_animation();
-    const lv_image_dsc_t *source = &items[index].thumbnail;
-    if (play)
-        source = &animation_frame;
-    else if (index < sizeof(photos) / sizeof(photos[0]))
-        source = &photos[index];
+    const lv_image_dsc_t *source = &photos[index];
 
     lv_image_set_src(detail_image, source);
-    lv_image_set_scale(detail_image, play ? 352 : 256);
+    lv_image_set_scale(detail_image, 256);
     lv_obj_center(detail_image);
     lv_label_set_text(caption, items[index].name);
     lv_obj_add_flag(grid, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(detail, LV_OBJ_FLAG_HIDDEN);
-    if (play)
-        render_gif_frame(animation_timer);
 }
 
 void ui_screen_gallery_on_leave(void)
 {
     lv_obj_add_flag(detail, LV_OBJ_FLAG_HIDDEN);
     lv_image_set_src(detail_image, NULL);
-    close_animation();
     lv_obj_remove_flag(grid, LV_OBJ_FLAG_HIDDEN);
+}
+
+bool ui_screen_gallery_handle_swipe(lv_dir_t dir)
+{
+    if (detail == NULL || lv_obj_has_flag(detail, LV_OBJ_FLAG_HIDDEN))
+        return false;
+
+    if (dir == LV_DIR_LEFT)
+    {
+        ui_screen_gallery_open((selected + 1U) % ITEM_COUNT);
+        return true;
+    }
+    if (dir == LV_DIR_RIGHT)
+    {
+        ui_screen_gallery_open((selected + ITEM_COUNT - 1U) % ITEM_COUNT);
+        return true;
+    }
+    if (dir == LV_DIR_TOP)
+    {
+        ui_screen_gallery_on_leave();
+        return true;
+    }
+    return false;
 }
 
 static void select_item(lv_event_t *event)

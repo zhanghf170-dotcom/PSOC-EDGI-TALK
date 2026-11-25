@@ -10,6 +10,7 @@
 #include <netdev.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -21,6 +22,9 @@
 #include <msh.h>
 
 #include "wifi_stream.h"
+#include "wifi_rtsp.h"
+#include "watch_info.h"
+#include "xiaozhi.h"
 #include "mini_jpeg_enc.h"
 #include "uvc_ai_app.h"
 #include "usbh_uvc_display_hook.h"
@@ -32,8 +36,14 @@
 
 #define WIFI_CFG_PATH           "/sdcard/wifi.cfg"
 #define WIFI_RAW_MAX_BYTES      (320U * 240U * 2U)
-#define WIFI_JPEG_MAX_BYTES     (64U * 1024U)
+#define WIFI_JPEG_SLOT_BYTES    (48U * 1024U)
+#define WIFI_MJPEG_HDR_RESERVE  96U
+#define WIFI_JPEG_MAX_BYTES     (WIFI_JPEG_SLOT_BYTES - WIFI_MJPEG_HDR_RESERVE - 2U)
 #define WIFI_HTTP_MAX_CLIENTS   2
+#define WIFI_JPEG_SLOTS         (WIFI_HTTP_MAX_CLIENTS + 3)
+#define WIFI_FRAME_WAIT_MS      3000
+#define WIFI_SNAPSHOT_WAIT_MS   450
+#define WIFI_MEDIA_RAM          __attribute__((section(".m33_m55_shared_hyperram"), aligned(32)))
 #define WIFI_MGR_EVT_SCAN       0x01U
 #define WIFI_MGR_EVT_CONNECT    0x02U
 #define WIFI_MGR_EVT_DISCONNECT 0x04U
@@ -54,18 +64,39 @@ typedef struct
     char     filename[48];
     uint32_t danger_count;
     float    confidence;
-    rt_bool_t valid;
+    int      slot;
+    size_t   length;
 } relay_req_t;
+
+static WIFI_MEDIA_RAM union
+{
+    uint8_t bytes[WIFI_RAW_MAX_BYTES];
+    uint16_t pixels[WIFI_RAW_MAX_BYTES / sizeof(uint16_t)];
+} g_wf_raw;
+static WIFI_MEDIA_RAM uint8_t g_wf_jpeg[WIFI_JPEG_SLOTS][WIFI_JPEG_SLOT_BYTES];
+
+static struct
+{
+    struct rt_thread thread;
+    struct rt_semaphore wake;
+    struct rt_semaphore frame_sem;
+    volatile int fd;
+    uint32_t frames_sent;
+    uint32_t send_errors;
+    uint32_t max_send_ms;
+    int last_errno;
+} g_wf_viewers[WIFI_HTTP_MAX_CLIENTS];
+rt_align(RT_ALIGN_SIZE) static uint8_t g_wf_viewer_stacks[WIFI_HTTP_MAX_CLIENTS][3072];
 
 static struct
 {
     rt_bool_t init;
     rt_bool_t whd_ready;
     rt_bool_t connected;
-    rt_bool_t ready;
+    volatile rt_bool_t ready;
     rt_bool_t scanning;
     rt_bool_t connecting;
-    rt_bool_t http_enabled;
+    volatile rt_bool_t http_enabled;
     rt_bool_t relay_auto_push;
     rt_bool_t last_relay_ok;
 
@@ -80,8 +111,6 @@ static struct
     uint16_t relay_port;
     rt_bool_t save_pending_cfg;
 
-    /* Dynamic HyperRAM/internal heap buffers (no DTCM bloat) */
-    uint8_t *raw_slot;
     uint16_t raw_w;
     uint16_t raw_h;
     uint8_t  raw_fmt;
@@ -90,14 +119,16 @@ static struct
     volatile rt_bool_t enc_busy;
     struct rt_mutex raw_lock;
 
-    uint8_t *jpeg_buf[2];
-    size_t   jpeg_len[2];
-    volatile int active_jpeg_idx;
-    volatile uint32_t jpeg_seq;
+    size_t jpeg_len[WIFI_JPEG_SLOTS];
+    size_t mjpeg_hdr_off[WIFI_JPEG_SLOTS];
+    size_t mjpeg_pkt_len[WIFI_JPEG_SLOTS];
+    unsigned int jpeg_readers[WIFI_JPEG_SLOTS];
+    int active_jpeg_idx;
+    uint32_t jpeg_seq;
+    volatile uint32_t camera_generation;
+    uint32_t raw_generation;
     struct rt_mutex jpeg_lock;
 
-    uint8_t *relay_jpeg_copy;
-    size_t   relay_jpeg_len;
     relay_req_t relay_req;
     struct rt_mutex relay_lock;
 
@@ -105,6 +136,7 @@ static struct
     uint32_t danger_seq;
     float    danger_conf;
     volatile rt_bool_t snap_req;
+    volatile rt_bool_t http_snap_req;
     char     snap_name[48];
 
     uint32_t stream_fps;
@@ -114,6 +146,11 @@ static struct
     uint32_t bytes_sent_accum;
     rt_tick_t stats_tick;
 
+    struct rt_semaphore enc_event;
+    struct rt_semaphore relay_event;
+    struct rt_semaphore http_snap_event;
+    struct rt_semaphore scan_done_event;
+    struct rt_event mgr_event;
     rt_sem_t enc_sem;
     rt_sem_t relay_sem;
     rt_event_t mgr_evt;
@@ -222,16 +259,16 @@ static struct netdev *wifi_station_netdev(void)
     return sta != RT_NULL ? sta->netdev : RT_NULL;
 }
 
-static uint32_t wifi_station_ip(void)
+uint32_t wifi_mgr_get_station_ip(void)
 {
     struct netdev *nd = wifi_station_netdev();
-    return (g_wf.ready && nd != RT_NULL && netdev_is_up(nd)) ? ip4_addr_get_u32(&nd->ip_addr) : 0U;
+    return ((g_wf.ready || rt_wlan_is_ready()) && nd != RT_NULL && netdev_is_up(nd)) ? ip4_addr_get_u32(&nd->ip_addr) : 0U;
 }
 
 rt_bool_t wifi_mgr_is_lan_peer(uint32_t peer_ip)
 {
     struct netdev *nd = wifi_station_netdev();
-    uint32_t ip = wifi_station_ip();
+    uint32_t ip = wifi_mgr_get_station_ip();
     uint32_t mask;
 
     if (nd == RT_NULL || ip == 0U)
@@ -240,6 +277,22 @@ rt_bool_t wifi_mgr_is_lan_peer(uint32_t peer_ip)
     mask = ip4_addr_get_u32(&nd->netmask);
     return mask != 0U && (peer_ip & mask) == (ip & mask) &&
            (peer_ip & ~mask) != 0U && (peer_ip & ~mask) != ~mask;
+}
+
+uint32_t wifi_mgr_get_lan_broadcast(void)
+{
+    struct netdev *nd = wifi_station_netdev();
+    uint32_t ip = wifi_mgr_get_station_ip();
+    uint32_t mask;
+
+    if (nd == RT_NULL || ip == 0U)
+        return 0U;
+
+    mask = ip4_addr_get_u32(&nd->netmask);
+    if (mask == 0U || mask == 0xFFFFFFFFU)
+        return 0U;
+
+    return (ip & mask) | ~mask;
 }
 
 static void wifi_get_ip_string(char *buf, size_t len)
@@ -290,6 +343,8 @@ static void wf_wlan_event_cb(int event, struct rt_wlan_buff *buff, void *paramet
         g_wf.ready = RT_TRUE;
         g_wf.connecting = RT_FALSE;
         wifi_set_status_msg("Online");
+        watch_info_trigger_sync();
+        xiaozhi_on_wifi_ready();
         break;
     default:
         break;
@@ -401,48 +456,119 @@ static void wifi_sort_scan_results(void)
 
 /* ----------------- JPEG Encoder & Relay Threads ----------------- */
 
+static int wf_pin_jpeg(uint32_t *last_seq, size_t *length)
+{
+    int slot = -1;
+    rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
+    if (g_wf.active_jpeg_idx >= 0 && (!last_seq || *last_seq != g_wf.jpeg_seq))
+    {
+        slot = g_wf.active_jpeg_idx;
+        g_wf.jpeg_readers[slot]++;
+        *length = g_wf.jpeg_len[slot];
+        if (last_seq)
+            *last_seq = g_wf.jpeg_seq;
+    }
+    rt_mutex_release(&g_wf.jpeg_lock);
+    return slot;
+}
+
+static void wf_unpin_jpeg(int slot)
+{
+    if (slot < 0)
+        return;
+    rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
+    g_wf.jpeg_readers[slot]--;
+    rt_mutex_release(&g_wf.jpeg_lock);
+}
+
+const uint8_t *wifi_stream_acquire_rtsp_jpeg(uint32_t *seq, size_t *len, int *slot)
+{
+    *slot = uvc_app_has_frame() ? wf_pin_jpeg(seq, len) : -1;
+    return *slot < 0 ? RT_NULL : &g_wf_jpeg[*slot][WIFI_MJPEG_HDR_RESERVE];
+}
+
+void wifi_stream_release_rtsp_jpeg(int slot)
+{
+    wf_unpin_jpeg(slot);
+}
+
+static int wf_take_jpeg_back_buffer(void)
+{
+    int back = -1;
+    rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
+    for (int slot = 0; slot < WIFI_JPEG_SLOTS; ++slot)
+    {
+        if (slot != g_wf.active_jpeg_idx && g_wf.jpeg_readers[slot] == 0U)
+        {
+            back = slot;
+            break;
+        }
+    }
+    rt_mutex_release(&g_wf.jpeg_lock);
+    return back;
+}
+
 static void wf_trigger_relay_push(const char *fname, uint32_t danger_cnt, float conf)
 {
-    if ((g_wf.relay_host[0] == '\0') || (g_wf.relay_jpeg_copy == NULL) ||
-        (g_wf.relay_sem == RT_NULL))
+    if ((g_wf.relay_host[0] == '\0') || (g_wf.relay_sem == RT_NULL))
     {
         return;
     }
 
-    rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
-    int idx = g_wf.active_jpeg_idx;
-    size_t len = g_wf.jpeg_len[idx];
-    if (len == 0U || len > WIFI_JPEG_MAX_BYTES)
-    {
-        rt_mutex_release(&g_wf.jpeg_lock);
+    size_t len = 0;
+    int slot = wf_pin_jpeg(NULL, &len);
+    if (slot < 0)
         return;
-    }
 
     rt_mutex_take(&g_wf.relay_lock, RT_WAITING_FOREVER);
-    rt_memcpy(g_wf.relay_jpeg_copy, g_wf.jpeg_buf[idx], len);
-    g_wf.relay_jpeg_len = len;
+    int previous = g_wf.relay_req.slot;
+    g_wf.relay_req.slot = slot;
+    g_wf.relay_req.length = len;
     rt_strncpy(g_wf.relay_req.filename, fname, sizeof(g_wf.relay_req.filename) - 1U);
     g_wf.relay_req.filename[sizeof(g_wf.relay_req.filename) - 1U] = '\0';
     g_wf.relay_req.danger_count = danger_cnt;
     g_wf.relay_req.confidence   = conf;
-    g_wf.relay_req.valid        = RT_TRUE;
     rt_mutex_release(&g_wf.relay_lock);
+    wf_unpin_jpeg(previous);
 
-    rt_mutex_release(&g_wf.jpeg_lock);
     rt_sem_release(g_wf.relay_sem);
 }
 
-static size_t wf_encode_from_stage_fallback(uint8_t *dst, size_t cap)
+static size_t wf_encode_frame(int back_idx, rt_bool_t capture, uint32_t generation)
 {
     uint16_t w = 0, h = 0;
-    const uint16_t *stage = uvc_display_get_stage_rgb565(&w, &h, RT_NULL);
-    size_t out_sz = 0U;
-
-    if (stage == NULL || w == 0 || h == 0) return 0U;
-    uvc_display_lock_stage();
-    out_sz = mini_jpeg_encode_rgb565(stage, (int)w, (int)h, g_wf.jpeg_quality, dst, cap);
-    uvc_display_unlock_stage();
-    return out_sz;
+    size_t length = 0;
+    uint8_t *dst = (back_idx >= 0) ? &g_wf_jpeg[back_idx][WIFI_MJPEG_HDR_RESERVE] : RT_NULL;
+    rt_mutex_take(&g_wf.raw_lock, RT_WAITING_FOREVER);
+    if (g_wf.raw_pending)
+    {
+        if (dst != RT_NULL && g_wf.raw_generation == generation)
+        {
+            w = g_wf.raw_w;
+            h = g_wf.raw_h;
+            if (g_wf.raw_fmt == 0U && g_wf.raw_size >= (uint32_t)w * h * 2U)
+            {
+                length = mini_jpeg_encode_yuyv(g_wf_raw.bytes, w, h, g_wf.jpeg_quality,
+                                              dst, WIFI_JPEG_MAX_BYTES);
+            }
+            else if (g_wf.raw_fmt == 1U && g_wf.raw_size > 4U &&
+                     g_wf.raw_size <= WIFI_JPEG_MAX_BYTES &&
+                     g_wf_raw.bytes[0] == 0xffU && g_wf_raw.bytes[1] == 0xd8U)
+            {
+                length = g_wf.raw_size;
+                rt_memcpy(dst, g_wf_raw.bytes, length);
+            }
+        }
+        g_wf.raw_pending = RT_FALSE;
+    }
+    if (length == 0U && capture && dst != RT_NULL && uvc_app_has_frame() &&
+        uvc_display_copy_stage_rgb565(g_wf_raw.pixels, sizeof(g_wf_raw), &w, &h))
+    {
+        length = mini_jpeg_encode_rgb565(g_wf_raw.pixels, w, h, g_wf.jpeg_quality,
+                                        dst, WIFI_JPEG_MAX_BYTES);
+    }
+    rt_mutex_release(&g_wf.raw_lock);
+    return length;
 }
 
 static void wf_enc_thread_entry(void *parameter)
@@ -455,94 +581,92 @@ static void wf_enc_thread_entry(void *parameter)
     {
         rt_sem_take(g_wf.enc_sem, RT_WAITING_FOREVER);
 
+        char snap_name[sizeof(g_wf.snap_name)];
+        rt_base_t level = rt_hw_interrupt_disable();
         rt_bool_t do_danger = g_wf.danger_req;
-        rt_bool_t do_snap   = g_wf.snap_req;
-        rt_bool_t do_frame  = g_wf.raw_pending;
-
-        if (!do_danger && !do_snap && !do_frame)
+        rt_bool_t do_snap = g_wf.snap_req;
+        rt_bool_t do_http_snap = g_wf.http_snap_req;
+        uint32_t danger_seq = g_wf.danger_seq;
+        float danger_conf = g_wf.danger_conf;
+        if (do_snap)
+            rt_memcpy(snap_name, g_wf.snap_name, sizeof(snap_name));
+        g_wf.danger_req = RT_FALSE;
+        g_wf.snap_req = RT_FALSE;
+        g_wf.http_snap_req = RT_FALSE;
+        rt_hw_interrupt_enable(level);
+        if (!do_danger && !do_snap && !do_http_snap && !g_wf.raw_pending)
         {
             continue;
         }
 
         g_wf.enc_busy = RT_TRUE;
-
-        /* Encode next back buffer */
-        int back_idx = 1 - g_wf.active_jpeg_idx;
-        uint8_t *dst = g_wf.jpeg_buf[back_idx];
-        size_t enc_len = 0U;
-
-        if (dst != NULL)
+        uint32_t generation = g_wf.camera_generation;
+        int back_idx = wf_take_jpeg_back_buffer();
+        size_t enc_len = wf_encode_frame(back_idx, do_danger || do_snap || do_http_snap, generation);
+        if (enc_len > 0U)
         {
-            if (g_wf.raw_pending && g_wf.raw_slot != NULL && g_wf.raw_size > 0U)
+            char mhdr[WIFI_MJPEG_HDR_RESERVE];
+            int hlen = rt_snprintf(mhdr, sizeof(mhdr),
+                                   "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                                   (unsigned)enc_len);
+            size_t hdr_off = WIFI_MJPEG_HDR_RESERVE;
+            if (hlen > 0 && (size_t)hlen <= WIFI_MJPEG_HDR_RESERVE)
             {
-                rt_mutex_take(&g_wf.raw_lock, RT_WAITING_FOREVER);
-                uint16_t w = g_wf.raw_w;
-                uint16_t h = g_wf.raw_h;
-                uint8_t fmt = g_wf.raw_fmt;
-                uint32_t sz = g_wf.raw_size;
-
-                if (fmt == 0U /* YUYV */ && sz >= (uint32_t)w * (uint32_t)h * 2U)
-                {
-                    enc_len = mini_jpeg_encode_yuyv(g_wf.raw_slot, (int)w, (int)h,
-                                                    g_wf.jpeg_quality, dst, WIFI_JPEG_MAX_BYTES);
-                }
-                else if (fmt == 1U /* MJPEG */ && sz > 4U && sz <= WIFI_JPEG_MAX_BYTES &&
-                         g_wf.raw_slot[0] == 0xFFU && g_wf.raw_slot[1] == 0xD8U)
-                {
-                    rt_memcpy(dst, g_wf.raw_slot, sz);
-                    enc_len = sz;
-                }
-                g_wf.raw_pending = RT_FALSE;
-                rt_mutex_release(&g_wf.raw_lock);
+                hdr_off = WIFI_MJPEG_HDR_RESERVE - (size_t)hlen;
+                rt_memcpy(&g_wf_jpeg[back_idx][hdr_off], mhdr, (size_t)hlen);
             }
-            else if (do_danger || do_snap)
-            {
-                enc_len = wf_encode_from_stage_fallback(dst, WIFI_JPEG_MAX_BYTES);
-            }
+            g_wf_jpeg[back_idx][WIFI_MJPEG_HDR_RESERVE + enc_len]     = '\r';
+            g_wf_jpeg[back_idx][WIFI_MJPEG_HDR_RESERVE + enc_len + 1] = '\n';
 
-            if (enc_len > 0U)
+            rt_bool_t published = RT_FALSE;
+            rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
+            if (generation == g_wf.camera_generation)
             {
-                rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
-                g_wf.jpeg_len[back_idx] = enc_len;
+                g_wf.jpeg_len[back_idx]      = enc_len;
+                g_wf.mjpeg_hdr_off[back_idx] = hdr_off;
+                g_wf.mjpeg_pkt_len[back_idx] = (WIFI_MJPEG_HDR_RESERVE - hdr_off) + enc_len + 2U;
                 g_wf.active_jpeg_idx = back_idx;
                 g_wf.jpeg_seq++;
                 g_wf.frames_encoded++;
-                rt_mutex_release(&g_wf.jpeg_lock);
-
                 fps_cnt++;
-                rt_tick_t now = rt_tick_get();
-                uint32_t dt_ms = ((uint32_t)(now - last_fps_tick)) * (1000U / RT_TICK_PER_SECOND);
-                if (dt_ms >= 1000U)
+                published = RT_TRUE;
+            }
+            rt_mutex_release(&g_wf.jpeg_lock);
+
+            if (published)
+            {
+                for (unsigned int v = 0; v < WIFI_HTTP_MAX_CLIENTS; ++v)
                 {
-                    g_wf.stream_fps = (fps_cnt * 1000U) / dt_ms;
-                    fps_cnt = 0U;
-                    last_fps_tick = now;
+                    if (g_wf_viewers[v].fd >= 0 && g_wf_viewers[v].frame_sem.value == 0)
+                    {
+                        rt_sem_release(&g_wf_viewers[v].frame_sem);
+                    }
                 }
             }
         }
-
-        if (do_danger)
+        rt_tick_t now = rt_tick_get();
+        uint32_t dt_ms = ((uint32_t)(now - last_fps_tick)) * (1000U / RT_TICK_PER_SECOND);
+        if (dt_ms >= 1000U)
         {
-            g_wf.danger_req = RT_FALSE;
-            if (g_wf.relay_auto_push)
-            {
-                char fname[48];
-                rt_snprintf(fname, sizeof(fname), "danger_%04lu.jpg", (unsigned long)g_wf.danger_seq);
-                wf_trigger_relay_push(fname, g_wf.danger_seq, g_wf.danger_conf);
-            }
+            g_wf.stream_fps = (fps_cnt * 1000U) / dt_ms;
+            fps_cnt = 0U;
+            last_fps_tick = now;
         }
-
-        if (do_snap)
+        if (do_http_snap)
+            rt_sem_release(&g_wf.http_snap_event);
+        if (do_danger && g_wf.relay_auto_push)
         {
             char fname[48];
-            rt_strncpy(fname, g_wf.snap_name, sizeof(fname) - 1U);
-            fname[sizeof(fname) - 1U] = '\0';
-            g_wf.snap_req = RT_FALSE;
-            if (fname[0] == '\0')
+            rt_snprintf(fname, sizeof(fname), "danger_%04lu.jpg", (unsigned long)danger_seq);
+            wf_trigger_relay_push(fname, danger_seq, danger_conf);
+        }
+        if (do_snap)
+        {
+            if (snap_name[0] == '\0')
             {
-                rt_snprintf(fname, sizeof(fname), "snap_%04lu.jpg", (unsigned long)g_wf.frames_encoded);
+                rt_snprintf(snap_name, sizeof(snap_name), "snap_%04lu.jpg", (unsigned long)g_wf.frames_encoded);
             }
-            wf_trigger_relay_push(fname, 0U, 0.0f);
+            wf_trigger_relay_push(snap_name, 0U, 0.0f);
         }
 
         g_wf.enc_busy = RT_FALSE;
@@ -574,41 +698,31 @@ static void wf_relay_thread_entry(void *parameter)
     {
         rt_sem_take(g_wf.relay_sem, RT_WAITING_FOREVER);
 
-        if (!rt_wlan_is_ready() || (g_wf.relay_host[0] == '\0'))
-        {
-            g_wf.last_relay_ok = RT_FALSE;
-            continue;
-        }
-
         rt_mutex_take(&g_wf.relay_lock, RT_WAITING_FOREVER);
-        if (!g_wf.relay_req.valid || g_wf.relay_jpeg_len == 0U)
+        relay_req_t req = g_wf.relay_req;
+        char host[sizeof(g_wf.relay_host)];
+        rt_memcpy(host, g_wf.relay_host, sizeof(host));
+        uint16_t port = g_wf.relay_port;
+        g_wf.relay_req.slot = -1;
+        rt_mutex_release(&g_wf.relay_lock);
+        if (req.slot < 0)
         {
-            rt_mutex_release(&g_wf.relay_lock);
             continue;
         }
-
-        char fname[48];
-        rt_strncpy(fname, g_wf.relay_req.filename, sizeof(fname) - 1U);
-        fname[sizeof(fname) - 1U] = '\0';
-        size_t jpeg_sz = g_wf.relay_jpeg_len;
-        uint8_t *payload = (uint8_t *)rt_malloc(jpeg_sz);
-        if (payload != NULL)
+        if (!rt_wlan_is_ready() || host[0] == '\0')
         {
-            rt_memcpy(payload, g_wf.relay_jpeg_copy, jpeg_sz);
-        }
-        g_wf.relay_req.valid = RT_FALSE;
-        rt_mutex_release(&g_wf.relay_lock);
-
-        if (payload == NULL)
-        {
+            wf_unpin_jpeg(req.slot);
             g_wf.last_relay_ok = RT_FALSE;
             continue;
         }
+        const char *fname = req.filename;
+        size_t jpeg_sz = req.length;
+        const uint8_t *payload = &g_wf_jpeg[req.slot][WIFI_MJPEG_HDR_RESERVE];
 
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0)
         {
-            rt_free(payload);
+            wf_unpin_jpeg(req.slot);
             g_wf.last_relay_ok = RT_FALSE;
             continue;
         }
@@ -620,12 +734,12 @@ static void wf_relay_thread_entry(void *parameter)
         struct sockaddr_in addr;
         rt_memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(g_wf.relay_port ? g_wf.relay_port : WIFI_STREAM_RELAY_PORT_DEF);
-        addr.sin_addr.s_addr = inet_addr(g_wf.relay_host);
+        addr.sin_port = htons(port ? port : WIFI_STREAM_RELAY_PORT_DEF);
+        addr.sin_addr.s_addr = inet_addr(host);
 
         if (addr.sin_addr.s_addr == IPADDR_NONE)
         {
-            struct hostent *he = gethostbyname(g_wf.relay_host);
+            struct hostent *he = gethostbyname(host);
             if (he != NULL && he->h_addr_list[0] != NULL)
             {
                 rt_memcpy(&addr.sin_addr, he->h_addr_list[0], sizeof(addr.sin_addr));
@@ -647,22 +761,22 @@ static void wf_relay_thread_entry(void *parameter)
                 g_wf.relay_sent_count++;
                 g_wf.last_relay_ok = RT_TRUE;
                 LOG_I("relay sent %s (%u B) -> %s:%u",
-                      fname, (unsigned)jpeg_sz, g_wf.relay_host, (unsigned)g_wf.relay_port);
+                      fname, (unsigned)jpeg_sz, host, (unsigned)port);
             }
             else
             {
                 g_wf.last_relay_ok = RT_FALSE;
-                LOG_W("relay send failed to %s:%u", g_wf.relay_host, (unsigned)g_wf.relay_port);
+                LOG_W("relay send failed to %s:%u", host, (unsigned)port);
             }
         }
         else
         {
             g_wf.last_relay_ok = RT_FALSE;
-            LOG_W("relay connect failed %s:%u", g_wf.relay_host, (unsigned)g_wf.relay_port);
+            LOG_W("relay connect failed %s:%u", host, (unsigned)port);
         }
 
         closesocket(sock);
-        rt_free(payload);
+        wf_unpin_jpeg(req.slot);
     }
 }
 
@@ -697,19 +811,13 @@ static const char g_html_index[] =
     "document.getElementById('fps').innerText=j.stream_fps+' FPS / '+(j.dualcore?'DUAL':'SOLO');"
     "}catch(e){}},700);</script></body></html>";
 
-static void wf_mjpeg_client_entry(void *parameter)
+static void wf_mjpeg_serve(unsigned int viewer, int client_fd)
 {
-    int client_fd = (int)(intptr_t)parameter;
-    uint8_t *local_buf = (uint8_t *)rt_malloc(WIFI_JPEG_MAX_BYTES);
     uint32_t last_seq = 0U;
-    char hdr[96];
+    rt_tick_t last_frame = rt_tick_get();
 
-    if (local_buf == NULL)
-    {
-        closesocket(client_fd);
-        g_wf.http_clients--;
-        return;
-    }
+    struct timeval tv_tx = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_tx, sizeof(tv_tx));
 
     static const char mjpeg_hdr[] =
         "HTTP/1.1 200 OK\r\n"
@@ -720,61 +828,130 @@ static void wf_mjpeg_client_entry(void *parameter)
 
     if (tcp_send_all(client_fd, mjpeg_hdr, sizeof(mjpeg_hdr) - 1U) != 0)
     {
-        rt_free(local_buf);
-        closesocket(client_fd);
-        g_wf.http_clients--;
+        g_wf_viewers[viewer].send_errors++;
+        g_wf_viewers[viewer].last_errno = errno;
         return;
     }
 
     while (g_wf.http_enabled && g_wf.ready)
     {
-        uint32_t cur_seq = g_wf.jpeg_seq;
-        if (cur_seq != last_seq)
-        {
-            rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
-            int idx = g_wf.active_jpeg_idx;
-            size_t len = g_wf.jpeg_len[idx];
-            if (len > 0U && len <= WIFI_JPEG_MAX_BYTES)
-            {
-                rt_memcpy(local_buf, g_wf.jpeg_buf[idx], len);
-                last_seq = g_wf.jpeg_seq;
-            }
-            else
-            {
-                len = 0U;
-            }
-            rt_mutex_release(&g_wf.jpeg_lock);
+        char peer;
+        int peek = recv(client_fd, &peer, sizeof(peer), MSG_PEEK | MSG_DONTWAIT);
+        if (peek == 0 || (peek < 0 && errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR))
+            break;
+        if (!uvc_app_has_frame() &&
+            (rt_tick_t)(rt_tick_get() - last_frame) >= rt_tick_from_millisecond(WIFI_FRAME_WAIT_MS))
+            break;
 
-            if (len > 0U)
+        size_t len = 0;
+        int slot = uvc_app_has_frame() ? wf_pin_jpeg(&last_seq, &len) : -1;
+        if (slot >= 0)
+        {
+            const uint8_t *pkt = &g_wf_jpeg[slot][g_wf.mjpeg_hdr_off[slot]];
+            size_t pkt_len = g_wf.mjpeg_pkt_len[slot];
+            rt_tick_t t_send = rt_tick_get();
+            int failed = (pkt_len == 0U) || (tcp_send_all(client_fd, pkt, pkt_len) != 0);
+            int send_err = failed ? errno : 0;
+            uint32_t send_ms = ((uint32_t)(rt_tick_get() - t_send)) * (1000U / RT_TICK_PER_SECOND);
+            wf_unpin_jpeg(slot);
+            if (send_ms > g_wf_viewers[viewer].max_send_ms)
+                g_wf_viewers[viewer].max_send_ms = send_ms;
+            if (failed)
             {
-                int hlen = rt_snprintf(hdr, sizeof(hdr),
-                                       "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                                       (unsigned)len);
-                if ((tcp_send_all(client_fd, hdr, (size_t)hlen) != 0) ||
-                    (tcp_send_all(client_fd, local_buf, len) != 0) ||
-                    (tcp_send_all(client_fd, "\r\n", 2U) != 0))
-                {
-                    break;
-                }
-                g_wf.bytes_sent_accum += (uint32_t)(hlen + len + 2);
-                rt_tick_t now = rt_tick_get();
-                uint32_t dt = ((uint32_t)(now - g_wf.stats_tick)) * (1000U / RT_TICK_PER_SECOND);
-                if (dt >= 1000U)
-                {
-                    g_wf.tx_kbps = (g_wf.bytes_sent_accum * 8U) / dt;
-                    g_wf.bytes_sent_accum = 0U;
-                    g_wf.stats_tick = now;
-                }
+                g_wf_viewers[viewer].send_errors++;
+                g_wf_viewers[viewer].last_errno = send_err;
+                break;
+            }
+            g_wf_viewers[viewer].frames_sent++;
+            last_frame = rt_tick_get();
+            rt_base_t level = rt_hw_interrupt_disable();
+            g_wf.bytes_sent_accum += (uint32_t)pkt_len;
+            uint32_t dt = ((uint32_t)(last_frame - g_wf.stats_tick)) * (1000U / RT_TICK_PER_SECOND);
+            if (dt >= 1000U)
+            {
+                g_wf.tx_kbps = (g_wf.bytes_sent_accum * 8U) / dt;
+                g_wf.bytes_sent_accum = 0U;
+                g_wf.stats_tick = last_frame;
+            }
+            rt_hw_interrupt_enable(level);
+            continue;
+        }
+        rt_sem_take(&g_wf_viewers[viewer].frame_sem, rt_tick_from_millisecond(25));
+    }
+}
+
+static void wf_mjpeg_client_entry(void *parameter)
+{
+    const unsigned int viewer = (unsigned int)(uintptr_t)parameter;
+    while (1)
+    {
+        rt_sem_take(&g_wf_viewers[viewer].wake, RT_WAITING_FOREVER);
+        rt_sem_control(&g_wf_viewers[viewer].frame_sem, RT_IPC_CMD_RESET, RT_NULL);
+        int fd = g_wf_viewers[viewer].fd;
+        wf_mjpeg_serve(viewer, fd);
+        closesocket(fd);
+        rt_base_t level = rt_hw_interrupt_disable();
+        g_wf_viewers[viewer].fd = -1;
+        g_wf.http_clients--;
+        rt_hw_interrupt_enable(level);
+    }
+}
+
+static rt_bool_t wf_assign_viewer(int fd)
+{
+    for (unsigned int viewer = 0; viewer < WIFI_HTTP_MAX_CLIENTS; ++viewer)
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+        rt_bool_t free = g_wf_viewers[viewer].fd < 0;
+        if (free)
+        {
+            g_wf_viewers[viewer].fd = fd;
+            g_wf.http_clients++;
+        }
+        rt_hw_interrupt_enable(level);
+        if (free)
+        {
+            rt_sem_release(&g_wf_viewers[viewer].wake);
+            return RT_TRUE;
+        }
+    }
+    return RT_FALSE;
+}
+
+static void wf_send_snapshot(int fd)
+{
+    size_t len = 0;
+    int slot = -1;
+    if (uvc_app_has_frame())
+    {
+        slot = wf_pin_jpeg(NULL, &len);
+        if (slot < 0)
+        {
+            rt_sem_control(&g_wf.http_snap_event, RT_IPC_CMD_RESET, RT_NULL);
+            g_wf.http_snap_req = RT_TRUE;
+            rt_sem_release(g_wf.enc_sem);
+            if (rt_sem_take(&g_wf.http_snap_event,
+                            rt_tick_from_millisecond(WIFI_SNAPSHOT_WAIT_MS)) == RT_EOK &&
+                uvc_app_has_frame())
+            {
+                slot = wf_pin_jpeg(NULL, &len);
             }
         }
-        int delay_ms = (g_wf.max_fps > 0) ? (1000 / g_wf.max_fps) : 120;
-        if (delay_ms < 40) delay_ms = 40;
-        rt_thread_mdelay((rt_int32_t)delay_ms);
     }
-
-    rt_free(local_buf);
-    closesocket(client_fd);
-    if (g_wf.http_clients > 0) g_wf.http_clients--;
+    if (slot < 0)
+    {
+        static const char unavailable[] =
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\n\r\nNo camera frame\n";
+        (void)tcp_send_all(fd, unavailable, sizeof(unavailable) - 1U);
+        return;
+    }
+    char hdr[96];
+    int hlen = rt_snprintf(hdr, sizeof(hdr),
+                           "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                           (unsigned)len);
+    if (tcp_send_all(fd, hdr, (size_t)hlen) == 0)
+        (void)tcp_send_all(fd, &g_wf_jpeg[slot][WIFI_MJPEG_HDR_RESERVE], len);
+    wf_unpin_jpeg(slot);
 }
 
 static void wf_handle_single_http_req(int cfd)
@@ -800,17 +977,8 @@ static void wf_handle_single_http_req(int cfd)
 
     if (strncmp(req, "GET /stream", 11) == 0)
     {
-        if (g_wf.http_clients < WIFI_HTTP_MAX_CLIENTS)
-        {
-            rt_thread_t t = rt_thread_create("wf_mjpg", wf_mjpeg_client_entry,
-                                             (void *)(intptr_t)cfd, 2560, 17, 10);
-            if (t != RT_NULL)
-            {
-                g_wf.http_clients++;
-                rt_thread_startup(t);
-                return;
-            }
-        }
+        if (wf_assign_viewer(cfd))
+            return;
         static const char busy[] = "HTTP/1.1 503 Busy\r\nConnection: close\r\n\r\nMax stream clients reached\n";
         (void)tcp_send_all(cfd, busy, sizeof(busy) - 1U);
         closesocket(cfd);
@@ -819,44 +987,7 @@ static void wf_handle_single_http_req(int cfd)
 
     if (strncmp(req, "GET /snapshot.jpg", 17) == 0)
     {
-        uint8_t *snap = (uint8_t *)rt_malloc(WIFI_JPEG_MAX_BYTES);
-        size_t len = 0U;
-        if (snap != NULL)
-        {
-            rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
-            int idx = g_wf.active_jpeg_idx;
-            len = g_wf.jpeg_len[idx];
-            if (len > 0U && len <= WIFI_JPEG_MAX_BYTES)
-            {
-                rt_memcpy(snap, g_wf.jpeg_buf[idx], len);
-            }
-            else
-            {
-                len = 0U;
-            }
-            rt_mutex_release(&g_wf.jpeg_lock);
-
-            if (len == 0U)
-            {
-                len = wf_encode_from_stage_fallback(snap, WIFI_JPEG_MAX_BYTES);
-            }
-
-            if (len > 0U)
-            {
-                char hdr[96];
-                int hlen = rt_snprintf(hdr, sizeof(hdr),
-                                       "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-                                       (unsigned)len);
-                (void)tcp_send_all(cfd, hdr, (size_t)hlen);
-                (void)tcp_send_all(cfd, snap, len);
-            }
-            else
-            {
-                static const char empty[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNo frame yet\n";
-                (void)tcp_send_all(cfd, empty, sizeof(empty) - 1U);
-            }
-            rt_free(snap);
-        }
+        wf_send_snapshot(cfd);
         closesocket(cfd);
         return;
     }
@@ -868,8 +999,8 @@ static void wf_handle_single_http_req(int cfd)
         rt_bool_t dc_on = RT_FALSE;
         uint32_t m33_hb = 0, m33_rtt = 0;
         char ip[20];
-        char body[384];
-        char resp[512];
+        char body[576];
+        char header[128];
         static const char *risk_names[3] = { "SAFE", "MID", "HIGH" };
 
         uvc_ai_app_get_telemetry(&tel);
@@ -877,30 +1008,38 @@ static void wf_handle_single_http_req(int cfd)
         dualcore_get_brief(&dc_on, &m33_hb, &m33_rtt);
         wifi_get_ip_string(ip, sizeof(ip));
         uint8_t ridx = (tel.risk_level < 3U) ? tel.risk_level : 0U;
+        rt_bool_t monitoring = tel.running && tel.ai_ready && uvc_app_has_frame() && tel.inference_ms > 0.0f;
 
         int blen = rt_snprintf(
             body, sizeof(body),
             "{\"running\":%s,\"alert_active\":%s,\"risk_level\":%u,\"risk_label\":\"%s\","
-            "\"conf_pct\":%.0f,\"inference_ms\":%.1f,\"danger_count\":%lu,"
+            "\"mode\":\"%s\",\"det_count\":%u,\"conf_pct\":%.0f,\"inference_ms\":%.1f,\"danger_count\":%lu,"
             "\"temp\":%.1f,\"humi\":%.1f,\"cam_fps\":%lu,\"stream_fps\":%lu,"
             "\"tx_kbps\":%lu,\"rssi\":%d,\"ip\":\"%s\",\"dualcore\":%s,"
-            "\"m33_hb\":%lu,\"m33_rtt_ms\":%lu}",
-            tel.running ? "true" : "false",
+            "\"m33_hb\":%lu,\"m33_rtt_ms\":%lu,\"camera_state\":\"%s\",\"frames\":%lu,\"http_clients\":%d}",
+            monitoring ? "true" : "false",
             tel.alert_active ? "true" : "false",
-            (unsigned)ridx, risk_names[ridx],
-            (double)(tel.max_closed_conf * 100.0f),
+            (unsigned)ridx, monitoring && tel.mode == UVC_AI_MODE_FATIGUE ? risk_names[ridx] : "UNAVAILABLE",
+            tel.mode == UVC_AI_MODE_STEEL_BALL ? "steel_ball" : "fatigue",
+            (unsigned)tel.det_count,
+            (double)((tel.mode == UVC_AI_MODE_STEEL_BALL ? tel.max_det_conf : tel.max_closed_conf) * 100.0f),
             (double)tel.inference_ms,
             (unsigned long)tel.danger_count,
             (double)g_aht_temp, (double)g_aht_humi,
-            (unsigned long)cam_fps, (unsigned long)g_wf.stream_fps,
-            (unsigned long)g_wf.tx_kbps, rt_wlan_is_connected() ? rt_wlan_get_rssi() : 0,
+            (unsigned long)cam_fps, g_wf.http_clients ? (unsigned long)g_wf.stream_fps : 0UL,
+            g_wf.http_clients ? (unsigned long)g_wf.tx_kbps : 0UL, rt_wlan_is_connected() ? rt_wlan_get_rssi() : 0,
             ip, dc_on ? "true" : "false",
-            (unsigned long)m33_hb, (unsigned long)m33_rtt);
+            (unsigned long)m33_hb, (unsigned long)m33_rtt,
+            uvc_app_camera_state(), (unsigned long)uvc_app_frame_count(), g_wf.http_clients);
 
-        int hlen = rt_snprintf(resp, sizeof(resp),
-                               "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-                               blen, body);
-        (void)tcp_send_all(cfd, resp, (size_t)hlen);
+        if (blen > 0 && (size_t)blen < sizeof(body))
+        {
+            int hlen = rt_snprintf(header, sizeof(header),
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+                                    blen);
+            if (tcp_send_all(cfd, header, (size_t)hlen) == 0)
+                (void)tcp_send_all(cfd, body, (size_t)blen);
+        }
         closesocket(cfd);
         return;
     }
@@ -922,7 +1061,7 @@ static void wf_http_thread_entry(void *parameter)
 
     while (1)
     {
-        uint32_t station_ip = wifi_station_ip();
+        uint32_t station_ip = wifi_mgr_get_station_ip();
         if (listen_fd >= 0 && (!g_wf.http_enabled || station_ip != bound_ip))
         {
             closesocket(listen_fd);
@@ -1026,19 +1165,44 @@ static void wf_mgr_thread_entry(void *parameter)
         rt_thread_mdelay(150);
     }
 
+    if (g_wf.whd_ready)
     {
         char cfg_ssid[33] = {0};
         char cfg_pwd[65]  = {0};
-        if (wifi_load_cfg_file(cfg_ssid, sizeof(cfg_ssid),
-                               cfg_pwd, sizeof(cfg_pwd),
-                               g_wf.relay_host, sizeof(g_wf.relay_host),
-                               &g_wf.relay_port) && g_wf.whd_ready)
+        rt_bool_t has_cred = wifi_load_cfg_file(cfg_ssid, sizeof(cfg_ssid),
+                                                cfg_pwd, sizeof(cfg_pwd),
+                                                g_wf.relay_host, sizeof(g_wf.relay_host),
+                                                &g_wf.relay_port);
+#if defined(WIFI_DEFAULT_SSID) && defined(WIFI_DEFAULT_PWD)
+        if (!has_cred && WIFI_DEFAULT_SSID[0] != '\0')
+        {
+            rt_strncpy(cfg_ssid, WIFI_DEFAULT_SSID, sizeof(cfg_ssid) - 1U);
+            cfg_ssid[sizeof(cfg_ssid) - 1U] = '\0';
+            rt_strncpy(cfg_pwd, WIFI_DEFAULT_PWD, sizeof(cfg_pwd) - 1U);
+            cfg_pwd[sizeof(cfg_pwd) - 1U] = '\0';
+            has_cred = RT_TRUE;
+        }
+#endif
+        if (has_cred)
         {
             rt_strncpy(g_wf.ssid, cfg_ssid, sizeof(g_wf.ssid) - 1U);
+            g_wf.ssid[sizeof(g_wf.ssid) - 1U] = '\0';
             rt_strncpy(g_wf.pwd,  cfg_pwd,  sizeof(g_wf.pwd) - 1U);
+            g_wf.pwd[sizeof(g_wf.pwd) - 1U] = '\0';
             g_wf.connecting = RT_TRUE;
             wifi_set_status_msg("Auto-connecting...");
-            rt_wlan_connect(g_wf.ssid, g_wf.pwd);
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (rt_wlan_connect(g_wf.ssid, g_wf.pwd) == RT_EOK)
+                    break;
+                LOG_W("auto-connect attempt %d failed, retrying...", attempt + 1);
+                rt_thread_mdelay(2000);
+            }
+            if (!rt_wlan_is_connected())
+            {
+                g_wf.connecting = RT_FALSE;
+                wifi_set_status_msg("Connect failed");
+            }
         }
     }
 
@@ -1113,6 +1277,12 @@ static void wf_mgr_thread_entry(void *parameter)
 
 /* ----------------- Public APIs ----------------- */
 
+rt_align(RT_ALIGN_SIZE) static uint8_t g_wf_enc_stack[6144];
+rt_align(RT_ALIGN_SIZE) static uint8_t g_wf_relay_stack[4096];
+rt_align(RT_ALIGN_SIZE) static uint8_t g_wf_http_stack[4096];
+rt_align(RT_ALIGN_SIZE) static uint8_t g_wf_mgr_stack[3072];
+static struct rt_thread g_wf_threads[4];
+
 int wifi_stream_init(void)
 {
     if (g_wf.init)
@@ -1127,6 +1297,8 @@ int wifi_stream_init(void)
     g_wf.max_fps         = 8;
     g_wf.relay_port      = WIFI_STREAM_RELAY_PORT_DEF;
     g_wf.stats_tick      = rt_tick_get();
+    g_wf.active_jpeg_idx = -1;
+    g_wf.relay_req.slot  = -1;
     wifi_set_status_msg("Initializing Wi-Fi...");
 
     rt_mutex_init(&g_wf.raw_lock,   "wf_raw", RT_IPC_FLAG_PRIO);
@@ -1134,30 +1306,42 @@ int wifi_stream_init(void)
     rt_mutex_init(&g_wf.relay_lock, "wf_rly", RT_IPC_FLAG_PRIO);
     rt_mutex_init(&g_wf.scan_lock,  "wf_scn", RT_IPC_FLAG_PRIO);
 
-    g_wf.raw_slot        = (uint8_t *)rt_malloc(WIFI_RAW_MAX_BYTES);
-    g_wf.jpeg_buf[0]     = (uint8_t *)rt_malloc(WIFI_JPEG_MAX_BYTES);
-    g_wf.jpeg_buf[1]     = (uint8_t *)rt_malloc(WIFI_JPEG_MAX_BYTES);
-    g_wf.relay_jpeg_copy = (uint8_t *)rt_malloc(WIFI_JPEG_MAX_BYTES);
+    rt_sem_init(&g_wf.enc_event, "wf_enc", 0, RT_IPC_FLAG_FIFO);
+    rt_sem_init(&g_wf.relay_event, "wf_rly", 0, RT_IPC_FLAG_FIFO);
+    rt_sem_init(&g_wf.http_snap_event, "wf_snap", 0, RT_IPC_FLAG_FIFO);
+    rt_sem_init(&g_wf.scan_done_event, "wf_scn", 0, RT_IPC_FLAG_FIFO);
+    rt_event_init(&g_wf.mgr_event, "wf_mgr", RT_IPC_FLAG_FIFO);
+    g_wf.enc_sem       = &g_wf.enc_event;
+    g_wf.relay_sem     = &g_wf.relay_event;
+    g_wf.scan_done_sem = &g_wf.scan_done_event;
+    g_wf.mgr_evt       = &g_wf.mgr_event;
 
-    g_wf.enc_sem       = rt_sem_create("wf_enc", 0, RT_IPC_FLAG_FIFO);
-    g_wf.relay_sem     = rt_sem_create("wf_rly", 0, RT_IPC_FLAG_FIFO);
-    g_wf.scan_done_sem = rt_sem_create("wf_scn", 0, RT_IPC_FLAG_FIFO);
-    g_wf.mgr_evt       = rt_event_create("wf_mgr", RT_IPC_FLAG_FIFO);
-
-    rt_thread_t t;
-    t = rt_thread_create("wf_enc", wf_enc_thread_entry, RT_NULL, 6144, 18, 10);
-    if (t) rt_thread_startup(t);
-
-    t = rt_thread_create("wf_rly", wf_relay_thread_entry, RT_NULL, 4096, 19, 10);
-    if (t) rt_thread_startup(t);
-
-    t = rt_thread_create("wf_http", wf_http_thread_entry, RT_NULL, 4096, 16, 10);
-    if (t) rt_thread_startup(t);
-
-    t = rt_thread_create("wf_mgr", wf_mgr_thread_entry, RT_NULL, 3072, 16, 10);
-    if (t) rt_thread_startup(t);
+    for (unsigned int viewer = 0; viewer < WIFI_HTTP_MAX_CLIENTS; ++viewer)
+    {
+        g_wf_viewers[viewer].fd = -1;
+        g_wf_viewers[viewer].frames_sent = 0U;
+        g_wf_viewers[viewer].send_errors = 0U;
+        g_wf_viewers[viewer].max_send_ms = 0U;
+        g_wf_viewers[viewer].last_errno  = 0;
+        rt_sem_init(&g_wf_viewers[viewer].wake, "wf_view", 0, RT_IPC_FLAG_FIFO);
+        rt_sem_init(&g_wf_viewers[viewer].frame_sem, viewer == 0 ? "wf_vfm0" : "wf_vfm1", 0, RT_IPC_FLAG_FIFO);
+        rt_thread_init(&g_wf_viewers[viewer].thread, viewer == 0 ? "wf_mjpg0" : "wf_mjpg1",
+                       wf_mjpeg_client_entry, (void *)(uintptr_t)viewer,
+                       g_wf_viewer_stacks[viewer], sizeof(g_wf_viewer_stacks[viewer]), 17, 10);
+        rt_thread_startup(&g_wf_viewers[viewer].thread);
+    }
+    rt_thread_init(&g_wf_threads[0], "wf_enc", wf_enc_thread_entry, RT_NULL,
+                   g_wf_enc_stack, sizeof(g_wf_enc_stack), 18, 10);
+    rt_thread_init(&g_wf_threads[1], "wf_rly", wf_relay_thread_entry, RT_NULL,
+                   g_wf_relay_stack, sizeof(g_wf_relay_stack), 19, 10);
+    rt_thread_init(&g_wf_threads[2], "wf_http", wf_http_thread_entry, RT_NULL,
+                   g_wf_http_stack, sizeof(g_wf_http_stack), 16, 10);
+    rt_thread_init(&g_wf_threads[3], "wf_mgr", wf_mgr_thread_entry, RT_NULL,
+                   g_wf_mgr_stack, sizeof(g_wf_mgr_stack), 16, 10);
 
     g_wf.init = RT_TRUE;
+    for (unsigned int i = 0; i < sizeof(g_wf_threads) / sizeof(g_wf_threads[0]); ++i)
+        rt_thread_startup(&g_wf_threads[i]);
     LOG_I("wifi_stream ready (http=:%d, relay_def=:%d)",
           WIFI_STREAM_HTTP_PORT, WIFI_STREAM_RELAY_PORT_DEF);
     return RT_EOK;
@@ -1170,15 +1354,16 @@ void wifi_stream_submit_frame(const uint8_t *buf, uint32_t size,
     rt_tick_t now;
     uint32_t min_interval_ms;
 
-    if (!g_wf.init || (buf == NULL) || (size == 0U) || (g_wf.raw_slot == NULL))
+    if (!g_wf.init || (buf == NULL) || (size == 0U))
     {
         return;
     }
 
     /* Skip copy/encode when idle unless HTTP stream or snapshot/danger needs fresh frame */
-    rt_bool_t urgent = g_wf.danger_req || g_wf.snap_req;
-    rt_bool_t active_stream = g_wf.http_enabled && (g_wf.http_clients > 0);
-    if (!urgent && !active_stream && (g_wf.jpeg_len[g_wf.active_jpeg_idx] > 0U))
+    rt_bool_t urgent = g_wf.danger_req || g_wf.snap_req || g_wf.http_snap_req;
+    rt_bool_t active_stream = (g_wf.http_enabled && g_wf.http_clients > 0) ||
+                              wifi_rtsp_is_playing();
+    if (!urgent && !active_stream)
     {
         return;
     }
@@ -1204,11 +1389,12 @@ void wifi_stream_submit_frame(const uint8_t *buf, uint32_t size,
         return;
     }
 
-    rt_memcpy(g_wf.raw_slot, buf, size);
+    rt_memcpy(g_wf_raw.bytes, buf, size);
     g_wf.raw_size = size;
     g_wf.raw_w    = w;
     g_wf.raw_h    = h;
     g_wf.raw_fmt  = fmt;
+    g_wf.raw_generation = g_wf.camera_generation;
     g_wf.raw_pending = RT_TRUE;
     last_submit_tick = now;
     rt_mutex_release(&g_wf.raw_lock);
@@ -1219,6 +1405,16 @@ void wifi_stream_submit_frame(const uint8_t *buf, uint32_t size,
     }
 }
 
+void wifi_stream_camera_stopped(void)
+{
+    if (!g_wf.init) return;
+    rt_mutex_take(&g_wf.jpeg_lock, RT_WAITING_FOREVER);
+    g_wf.camera_generation++;
+    g_wf.active_jpeg_idx = -1;
+    g_wf.stream_fps = 0;
+    rt_mutex_release(&g_wf.jpeg_lock);
+}
+
 void wifi_stream_notify_danger(uint32_t danger_count, float confidence)
 {
     if (!g_wf.init)
@@ -1226,9 +1422,11 @@ void wifi_stream_notify_danger(uint32_t danger_count, float confidence)
         return;
     }
 
+    rt_base_t level = rt_hw_interrupt_disable();
     g_wf.danger_seq  = danger_count;
     g_wf.danger_conf = confidence;
     g_wf.danger_req  = RT_TRUE;
+    rt_hw_interrupt_enable(level);
     if (g_wf.enc_sem != RT_NULL)
     {
         rt_sem_release(g_wf.enc_sem);
@@ -1273,6 +1471,9 @@ rt_bool_t wifi_stream_is_http_enabled(void)
 
 int wifi_stream_set_relay_config(const char *host, uint16_t port, rt_bool_t auto_push)
 {
+    if (!g_wf.init)
+        return -RT_ERROR;
+    rt_mutex_take(&g_wf.relay_lock, RT_WAITING_FOREVER);
     if (host != NULL)
     {
         rt_strncpy(g_wf.relay_host, host, sizeof(g_wf.relay_host) - 1U);
@@ -1283,6 +1484,7 @@ int wifi_stream_set_relay_config(const char *host, uint16_t port, rt_bool_t auto
         g_wf.relay_port = port;
     }
     g_wf.relay_auto_push = auto_push;
+    rt_mutex_release(&g_wf.relay_lock);
     return RT_EOK;
 }
 
@@ -1424,6 +1626,25 @@ static int cmd_wifi_stream_stop(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT_ALIAS(cmd_wifi_stream_stop, wifi_stream_stop, Disable HTTP MJPEG stream);
+
+static int cmd_wifi_stream_status(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    rt_kprintf("MJPEG clients=%d encoded=%lu fps=%lu kbps=%lu "
+               "v0(fd=%d,tx=%lu,err=%lu,max_ms=%lu,errno=%d) "
+               "v1(fd=%d,tx=%lu,err=%lu,max_ms=%lu,errno=%d)\n",
+               g_wf.http_clients, (unsigned long)g_wf.frames_encoded,
+               (unsigned long)g_wf.stream_fps, (unsigned long)g_wf.tx_kbps,
+               g_wf_viewers[0].fd, (unsigned long)g_wf_viewers[0].frames_sent,
+               (unsigned long)g_wf_viewers[0].send_errors,
+               (unsigned long)g_wf_viewers[0].max_send_ms, g_wf_viewers[0].last_errno,
+               g_wf_viewers[1].fd, (unsigned long)g_wf_viewers[1].frames_sent,
+               (unsigned long)g_wf_viewers[1].send_errors,
+               (unsigned long)g_wf_viewers[1].max_send_ms, g_wf_viewers[1].last_errno);
+    return 0;
+}
+MSH_CMD_EXPORT_ALIAS(cmd_wifi_stream_status, wifi_stream_status, Show MJPEG viewer telemetry);
 
 static int cmd_wifi_relay(int argc, char **argv)
 {

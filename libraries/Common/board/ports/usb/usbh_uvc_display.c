@@ -124,6 +124,7 @@ static UVC_SHARED_SECTION uint8_t g_uvc_mjpeg_frame[UVC_MJPEG_MAX_FRAME_SIZE];
 static UVC_RGB565_STAGE_SECTION CY_ALIGN(64) uint16_t g_uvc_yuyv_stage_rgb565[UVC_YUYV_STAGE_PIXELS];
 static uint16_t *g_uvc_stage_scratch = RT_NULL;
 static rt_mutex_t g_uvc_stage_lock = RT_NULL;
+static struct rt_mutex g_uvc_stage_mutex;
 static volatile uint32_t g_cam_frame_seq = 0U;
 
 #define UVC_MJPEG_STD_DHT_SIZE 420U
@@ -1063,7 +1064,8 @@ static UVC_ITCM_SECTION rt_err_t uvc_display_hw_init(void)
 {
     if (g_uvc_stage_lock == RT_NULL)
     {
-        g_uvc_stage_lock = rt_mutex_create("cam_stg", RT_IPC_FLAG_PRIO);
+        rt_mutex_init(&g_uvc_stage_mutex, "cam_stg", RT_IPC_FLAG_PRIO);
+        g_uvc_stage_lock = &g_uvc_stage_mutex;
     }
     if (g_uvc_stage_scratch == RT_NULL)
     {
@@ -1551,6 +1553,22 @@ const uint16_t *uvc_display_get_stage_rgb565(uint16_t *w, uint16_t *h, uint32_t 
     return g_uvc_yuyv_stage_rgb565;
 }
 
+rt_bool_t uvc_display_copy_stage_rgb565(uint16_t *dst, size_t capacity, uint16_t *w, uint16_t *h)
+{
+    if (dst == RT_NULL || capacity < UVC_YUYV_STAGE_BYTES || g_uvc_stage_lock == RT_NULL ||
+        rt_mutex_take(g_uvc_stage_lock, rt_tick_from_millisecond(40)) != RT_EOK)
+        return RT_FALSE;
+    rt_bool_t valid = g_cam_frame_seq != 0U;
+    if (valid)
+    {
+        memcpy(dst, g_uvc_yuyv_stage_rgb565, UVC_YUYV_STAGE_BYTES);
+        *w = UVC_YUYV_STAGE_W;
+        *h = UVC_YUYV_STAGE_H;
+    }
+    rt_mutex_release(g_uvc_stage_lock);
+    return valid;
+}
+
 void uvc_display_lock_stage(void)
 {
     if (g_uvc_stage_lock != RT_NULL)
@@ -1565,6 +1583,17 @@ void uvc_display_unlock_stage(void)
     {
         rt_mutex_release(g_uvc_stage_lock);
     }
+}
+
+void uvc_display_release_scratch(void)
+{
+    uvc_display_lock_stage();
+    if (g_uvc_stage_scratch != RT_NULL)
+    {
+        rt_free(g_uvc_stage_scratch);
+        g_uvc_stage_scratch = RT_NULL;
+    }
+    uvc_display_unlock_stage();
 }
 
 int uvc_display_init(void)
@@ -1587,8 +1616,10 @@ int uvc_display_init(void)
 
 void uvc_display_set_overlay_callback(uvc_display_overlay_cb_t cb, void *user_ctx)
 {
+    rt_base_t level = rt_hw_interrupt_disable();
     g_uvc_overlay_cb = cb;
     g_uvc_overlay_cb_ctx = user_ctx;
+    rt_hw_interrupt_enable(level);
 }
 
 static void uvc_display_run_overlay_callback(uint16_t *target_fb,
@@ -1599,8 +1630,12 @@ static void uvc_display_run_overlay_callback(uint16_t *target_fb,
                                              uint16_t dst_y_offset)
 {
     uvc_display_overlay_info_t info;
+    rt_base_t level = rt_hw_interrupt_disable();
+    uvc_display_overlay_cb_t cb = g_uvc_overlay_cb;
+    void *ctx = g_uvc_overlay_cb_ctx;
+    rt_hw_interrupt_enable(level);
 
-    if ((g_uvc_overlay_cb == RT_NULL) || (target_fb == RT_NULL)) {
+    if ((cb == RT_NULL) || (target_fb == RT_NULL)) {
         return;
     }
 
@@ -1614,7 +1649,7 @@ static void uvc_display_run_overlay_callback(uint16_t *target_fb,
     info.dst_height = dst_h;
     info.dst_y_offset = dst_y_offset;
 
-    g_uvc_overlay_cb(&info, g_uvc_overlay_cb_ctx);
+    cb(&info, ctx);
 }
 
 UVC_ITCM_SECTION void uvc_display_frame(struct usbh_videoframe *frame,

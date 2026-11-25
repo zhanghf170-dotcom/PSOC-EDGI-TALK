@@ -28,6 +28,9 @@ function Copy-SdkTree([string]$Source, [string]$Destination) {
 Copy-SdkTree 'libraries' 'libraries'
 Copy-SdkTree 'projects/libs' 'libs'
 Copy-SdkTree 'rt-thread' 'rt-thread'
+foreach ($Package in @('cJSON-v1.7.17', 'mbedtls-v2.28.1', 'opus-1.4', 'webclient-v2.2.0')) {
+    Copy-SdkTree "projects/Edgi_Talk_M55_XiaoZhi/packages/$Package" "packages/$Package"
+}
 Copy-SdkTree 'tools/edgeprotecttools/bin' 'tools/edgeprotecttools/bin'
 Copy-SdkTree 'tools/edgeprotecttools/cm33_s_signed_fw' 'tools/edgeprotecttools/cm33_s_signed_fw'
 
@@ -42,6 +45,22 @@ foreach ($Resource in @('55500A1.clm_blob', '55500A1.trxcse', 'cyw55513modpse84s
 if ($ModelRoot) {
     $Destination = Join-Path $RepoRoot 'libraries/Common/deepcraft_ai/model'
     $ModelFiles = @('model.c', 'model.h')
+    $SteelBallFiles = @('steel_ball_model.c', 'steel_ball_model.h')
+    $SteelBallPresent = @($SteelBallFiles | Where-Object {
+        Test-Path -LiteralPath (Join-Path $ModelRoot $_) -PathType Leaf
+    })
+    if ($SteelBallPresent.Count -ne 0) {
+        if ($SteelBallPresent.Count -ne $SteelBallFiles.Count) {
+            throw 'Provide both steel_ball_model.c and steel_ball_model.h.'
+        }
+        $EyeModel = Join-Path $ModelRoot 'model.c'
+        if (!(Test-Path -LiteralPath $EyeModel -PathType Leaf) -or
+            !(Select-String -LiteralPath $EyeModel -Pattern 'ml_shared_get_arena' -Quiet) -or
+            !(Select-String -LiteralPath $EyeModel -Pattern 'ml_shared_get_scratch' -Quiet)) {
+            throw 'The steel-ball model requires the eye-state adapter with the shared arena and scratch buffer.'
+        }
+        $ModelFiles += $SteelBallFiles
+    }
     foreach ($File in $ModelFiles) {
         if (!(Test-Path -LiteralPath (Join-Path $ModelRoot $File) -PathType Leaf)) {
             throw "The model directory must contain $File."

@@ -693,7 +693,7 @@ void lv_vg_lite_buffer_from_draw_buf(vg_lite_buffer_t * buffer, const lv_draw_bu
         uintptr_t addr = (uintptr_t)draw_buf->data;
         bool is_noncache = ((addr >= 0x20000000UL && addr <= 0x2003FFFFUL) ||
                             (addr >= 0x26370000UL && addr <= 0x264FFFFFUL) ||
-                            (addr >= 0x64400000UL && addr <= 0x64FFFFFFUL));
+                            (addr >= 0x64600000UL && addr <= 0x64FFFFFFUL));
         if (!is_noncache && (addr != 0U)) {
             uint32_t clean_bytes = (draw_buf->data_size != 0U) ? draw_buf->data_size : (stride * (uint32_t)height);
             if (clean_bytes > 0U) {

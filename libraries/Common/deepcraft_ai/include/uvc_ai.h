@@ -12,9 +12,14 @@ extern "C" {
 #define UVC_AI_IMAGE_WIDTH       320U
 #define UVC_AI_IMAGE_HEIGHT      320U
 #define UVC_AI_NUM_CLASSES       3U
-#define UVC_AI_MAX_CLASS_LEN     10U
-#define UVC_AI_MAX_PREDICTIONS   5U
-#define UVC_AI_FRAMES_TO_SKIP    2U
+#define UVC_AI_MAX_CLASS_LEN     12U
+#define UVC_AI_MAX_PREDICTIONS   16U
+#define UVC_AI_FRAMES_TO_SKIP    1U
+
+typedef enum {
+    UVC_AI_MODE_FATIGUE = 0,
+    UVC_AI_MODE_STEEL_BALL = 1,
+} uvc_ai_mode_t;
 
 typedef struct {
     uint8_t initialized;
@@ -34,6 +39,11 @@ typedef struct {
         char class_string[UVC_AI_MAX_PREDICTIONS][UVC_AI_MAX_CLASS_LEN];
     };
 } uvc_ai_result_t;
+
+void uvc_ai_set_mode(uvc_ai_mode_t mode);
+uvc_ai_mode_t uvc_ai_get_mode(void);
+void uvc_ai_set_conf_threshold(float thresh);
+float uvc_ai_get_conf_threshold(void);
 
 int uvc_ai_init(const uvc_ai_config_t *config);
 void uvc_ai_deinit(void);

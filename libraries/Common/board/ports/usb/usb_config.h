@@ -36,7 +36,7 @@
 #endif
 
 /* attribute data into no cache ram */
-#define USB_NOCACHE_RAM_SECTION __attribute__((section(".cy_socmem_data")))
+#define USB_NOCACHE_RAM_SECTION __attribute__((section(".cy_usb_control_data")))
 
 /* use usb_memcpy default for high performance but cost more flash memory.
  * And, arm libc has a bug that memcpy() may cause data misalignment when the size is not a multiple of 4.

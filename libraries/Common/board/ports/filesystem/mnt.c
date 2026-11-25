@@ -15,10 +15,13 @@
 #ifndef BSP_USING_XiaoZhi
 extern const unsigned char cockpit_alarm_wav[];
 extern const size_t cockpit_alarm_wav_size;
+extern const unsigned char xiaozhi_ding_wav[];
+extern const size_t xiaozhi_ding_wav_size;
 
 static struct romfs_dirent _romfs_root[] =
 {
     {ROMFS_DIRENT_FILE, "cockpit_alarm.wav", (const rt_uint8_t *)cockpit_alarm_wav, 0},
+    {ROMFS_DIRENT_FILE, "xiaozhi_ding.wav", (const rt_uint8_t *)xiaozhi_ding_wav, 0},
 #ifdef BSP_USING_FLASH
     {ROMFS_DIRENT_DIR, "flash", RT_NULL, 0},
 #endif
@@ -92,26 +95,7 @@ static void _sdcard_mount(void)
         return;
     }
 
-    /* Mount failed, try to format */
-    LOG_W("sd card mount to '/sdcard' failed, try to mkfs...");
-    if (dfs_mkfs("elm", device_name) == 0)
-    {
-        LOG_I("sd card mkfs success!");
-
-        /* Try to mount again after formatting */
-        if (dfs_mount(device_name, "/sdcard", "elm", 0, 0) == RT_EOK)
-        {
-            LOG_I("sd card mount to '/sdcard' success!");
-        }
-        else
-        {
-            LOG_E("sd card mount to '/sdcard' failed after mkfs!");
-        }
-    }
-    else
-    {
-        LOG_E("sd card mkfs failed!");
-    }
+    LOG_W("Unable to mount SD card '%s' as FAT", device_name);
 #endif /* BSP_USING_SDCARD */
 }
 
@@ -177,6 +161,7 @@ int mnt_init(void)
 {
 #ifndef BSP_USING_XiaoZhi
     _romfs_root[0].size = cockpit_alarm_wav_size;
+    _romfs_root[1].size = xiaozhi_ding_wav_size;
 #endif
     if (dfs_mount(RT_NULL, "/", "rom", 0, &(romfs_root)) != 0)
     {

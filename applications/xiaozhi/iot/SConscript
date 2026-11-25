@@ -1,0 +1,18 @@
+from building import *
+import os
+
+cwd = GetCurrentDir()
+proj_root = os.path.abspath(os.path.join(cwd, '..', '..', '..')).replace('\\', '/')
+src = Glob('*.cpp') + Glob('*.c')
+path = [
+    cwd,
+    cwd + '/..',
+    cwd + '/../mcp',
+    proj_root + '/applications',
+    proj_root + '/applications/ui',
+    proj_root + '/libraries/HAL_Drivers',
+    proj_root + '/libraries/Common/board/ports/audio',
+    proj_root + '/packages/wavplayer-latest/inc',
+]
+group = DefineGroup('xiaozhi_iot', src, depend=['BSP_USING_XIAOZHI_COCKPIT'], CPPPATH=path)
+Return('group')

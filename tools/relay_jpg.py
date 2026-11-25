@@ -45,24 +45,34 @@ def fetch_weather(city, latitude, longitude):
 def serve_watch_info(service, location):
     weather = NO_WEATHER
     refresh_at = 0.0
+    if location:
+        try:
+            weather = fetch_weather(*location)
+            refresh_at = time.monotonic() + 600
+            print(f"[天气] 已就绪 city={weather[5]} code={weather[0]} temp={weather[1] / 10:.1f}C humi={weather[4]}%",
+                  flush=True)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"[天气] 启动预取失败 ({type(error).__name__})，稍后重试", flush=True)
+            refresh_at = time.monotonic() + 60
     with service:
         while True:
             request, peer = service.recvfrom(32)
             if request not in (b"WATCH1", b"WATCH2"):
                 continue
 
-            now = int(time.time())
-            report = weather if 0 <= now - weather[2] <= 1800 else NO_WEATHER
-            fields = report[:3] if request == b"WATCH1" else report
-            service.sendto(request + b" " + " ".join(str(value) for value in (now, *fields)).encode(), peer)
-
             if location and time.monotonic() >= refresh_at:
                 try:
                     weather = fetch_weather(*location)
                     refresh_at = time.monotonic() + 600
                 except (OSError, ValueError, KeyError, TypeError) as error:
-                    print(f"[天气] 暂时无法更新 ({type(error).__name__})")
+                    print(f"[天气] 暂时无法更新 ({type(error).__name__})", flush=True)
                     refresh_at = time.monotonic() + 60
+
+            now = int(time.time())
+            report = weather if 0 <= now - weather[2] <= 1800 else NO_WEATHER
+            fields = report[:3] if request == b"WATCH1" else report
+            service.sendto(request + b" " + " ".join(str(value) for value in (now, *fields)).encode(), peer)
+            print(f"[表盘] 同步 -> {peer[0]}:{peer[1]} code={report[0]} temp={report[1] / 10:.1f}C", flush=True)
 
 
 def sync_watch_serial(port, location, interval):
@@ -194,6 +204,8 @@ def main():
 
     if args.watch_info:
         service = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        service.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        service.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         service.bind((args.host, WATCH_INFO_PORT))
         threading.Thread(target=serve_watch_info, args=(service, location), daemon=True).start()
         print(f"[表盘] 时间/天气 {args.host}:{WATCH_INFO_PORT}/UDP")

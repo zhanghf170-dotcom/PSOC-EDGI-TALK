@@ -1,6 +1,7 @@
 #include <rtthread.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "uvc_ai_app.h"
 #include "uvc_ai.h"
@@ -27,11 +28,12 @@ extern float g_aht_humi;
 #define UVC_AI_LABEL_MAX_LEN       32U
 #define UVC_AI_FRAME_BYTES         ((uint32_t)UVC_AI_CAMERA_WIDTH * UVC_AI_CAMERA_HEIGHT * 2U)
 #define UVC_AI_WORKER_STACK_SIZE   65536U
-#define UVC_AI_DTCM_SECTION        __attribute__((section(".cy_dtcm")))
+#define UVC_AI_STACK_SECTION       __attribute__((section(".cy_ai_worker_stack")))
 /* Let the LVGL thread finish short refresh work before CPU-side inference. */
 #define UVC_AI_WORKER_PRIORITY     16U
 #define UVC_AI_WORKER_TICK         5U
 #define UVC_AI_WORKER_NAME         "uvc_aiwk"
+#define UVC_AI_RESULT_MAX_AGE_MS   500
 
 typedef struct {
     char ch;
@@ -46,17 +48,22 @@ typedef struct {
     uint32_t frame_counter;
     uint16_t src_width;
     uint16_t src_height;
-    rt_thread_t worker_thread;
-    rt_sem_t worker_sem;
-    uint8_t *worker_frame_buf;
     uvc_ai_result_t latest_result;
+    rt_tick_t result_tick;
+    uint32_t result_seq;
 } uvc_ai_app_ctx_t;
 
 static uvc_ai_app_ctx_t g_uvc_ai_app;
-/* Put AI worker stack in DTCM to reduce VLA-heavy postprocess latency. */
-static UVC_AI_DTCM_SECTION rt_uint8_t g_uvc_ai_worker_stack[UVC_AI_WORKER_STACK_SIZE];
+static struct rt_mutex g_uvc_ai_lifecycle;
+/* Place 64KB AI worker stack in NOLOAD D-Cacheable SoCMEM (frees 64KB DTCM + 64KB Flash). */
+static UVC_AI_STACK_SECTION rt_uint8_t g_uvc_ai_worker_stack[UVC_AI_WORKER_STACK_SIZE];
 static struct rt_thread g_uvc_ai_worker_tcb;
-static volatile rt_bool_t g_uvc_ai_worker_reaped;
+static struct rt_semaphore g_uvc_ai_worker_wake;
+static rt_bool_t g_uvc_ai_worker_initialized;
+static __attribute__((section(".cy_ml_arena_fast_data"), aligned(32)))
+    uint8_t g_uvc_ai_worker_frame[UVC_AI_FRAME_BYTES];
+static uvc_ai_result_t g_previous_ball_result;
+static rt_tick_t g_previous_ball_tick;
 
 static const uint16_t g_uvc_ai_class_colors[UVC_AI_NUM_CLASSES] = {
     UVC_RGB565(227, 66, 24),  /* class 0 */
@@ -66,6 +73,12 @@ static const uint16_t g_uvc_ai_class_colors[UVC_AI_NUM_CLASSES] = {
 static const uint16_t g_uvc_ai_unknown_color = UVC_RGB565(255, 215, 0);
 static const uint16_t g_uvc_ai_text_color = UVC_RGB565(255, 255, 255);
 static const uint16_t g_uvc_ai_model_bg = UVC_RGB565(0, 0, 0);
+
+static int uvc_ai_app_init_lock(void)
+{
+    return rt_mutex_init(&g_uvc_ai_lifecycle, "ai_life", RT_IPC_FLAG_PRIO);
+}
+INIT_COMPONENT_EXPORT(uvc_ai_app_init_lock);
 
 /* ---- Closed Eye risk-level classification ---- */
 #define UVC_AI_RISK_HIGH_THRESHOLD    0.90f   /* >= 90%: High risk */
@@ -168,20 +181,19 @@ static void uvc_ai_app_publish_result(const uvc_ai_result_t *result)
 
     level = rt_hw_interrupt_disable();
     memcpy(&g_uvc_ai_app.latest_result, result, sizeof(g_uvc_ai_app.latest_result));
+    g_uvc_ai_app.result_tick = rt_tick_get();
+    g_uvc_ai_app.result_seq++;
     rt_hw_interrupt_enable(level);
 }
 
-static void uvc_ai_app_snapshot_result(uvc_ai_result_t *result)
+static uint32_t uvc_ai_app_snapshot_result(uvc_ai_result_t *result, rt_tick_t *tick)
 {
-    rt_base_t level;
-
-    if (result == RT_NULL) {
-        return;
-    }
-
-    level = rt_hw_interrupt_disable();
+    rt_base_t level = rt_hw_interrupt_disable();
     memcpy(result, &g_uvc_ai_app.latest_result, sizeof(*result));
+    *tick = g_uvc_ai_app.result_tick;
+    uint32_t seq = g_uvc_ai_app.result_seq;
     rt_hw_interrupt_enable(level);
+    return seq;
 }
 
 static inline char uvc_ai_app_to_upper_ascii(char ch)
@@ -490,6 +502,20 @@ static int16_t uvc_ai_app_map_y_to_lcd(const uvc_display_overlay_info_t *info, i
     return uvc_ai_app_clamp_i16(y, 0, (int32_t)info->lcd_height - 1);
 }
 
+static int16_t uvc_ai_app_map_cam_y_to_lcd(const uvc_display_overlay_info_t *info, int16_t cam_y)
+{
+    int32_t y;
+
+    if ((info == RT_NULL) || (info->dst_height == 0U)) {
+        return 0;
+    }
+
+    y = uvc_ai_app_clamp_i16(cam_y, 0, (int32_t)UVC_AI_CAMERA_HEIGHT - 1);
+    y = (y * (int32_t)info->dst_height) / (int32_t)UVC_AI_CAMERA_HEIGHT + (int32_t)info->dst_y_offset;
+
+    return uvc_ai_app_clamp_i16(y, 0, (int32_t)info->lcd_height - 1);
+}
+
 static void uvc_ai_app_draw_text_box(const uvc_display_overlay_info_t *info,
                                      int16_t x, int16_t y, const char *text,
                                      uint16_t bg_color, uint16_t fg_color)
@@ -546,6 +572,47 @@ static void uvc_ai_app_draw_text_box(const uvc_display_overlay_info_t *info,
                             fg_color);
 }
 
+static rt_bool_t uvc_ai_ball_matches(const int16_t *box, const int16_t *previous)
+{
+    int16_t left = box[0] > previous[0] ? box[0] : previous[0];
+    int16_t top = box[1] > previous[1] ? box[1] : previous[1];
+    int16_t right = box[2] < previous[2] ? box[2] : previous[2];
+    int16_t bottom = box[3] < previous[3] ? box[3] : previous[3];
+    if (right <= left || bottom <= top)
+        return RT_FALSE;
+
+    int32_t overlap = (right - left) * (bottom - top);
+    int32_t area = (box[2] - box[0]) * (box[3] - box[1]);
+    int32_t previous_area = (previous[2] - previous[0]) * (previous[3] - previous[1]);
+    return 10 * overlap >= 3 * (area + previous_area - overlap);
+}
+
+static void uvc_ai_confirm_balls(uvc_ai_result_t *result)
+{
+    uvc_ai_result_t raw = *result;
+    rt_tick_t now = rt_tick_get();
+    result->count = 0U;
+
+    if ((rt_tick_t)(now - g_previous_ball_tick) <
+        rt_tick_from_millisecond(UVC_AI_RESULT_MAX_AGE_MS)) {
+        for (uint8_t i = 0U; i < raw.count; i++) {
+            const int16_t *box = &raw.bbox_int16[i * 4U];
+            for (uint8_t j = 0U; j < g_previous_ball_result.count; j++) {
+                if (!uvc_ai_ball_matches(box, &g_previous_ball_result.bbox_int16[j * 4U]))
+                    continue;
+                uint8_t dst = result->count++;
+                memcpy(&result->bbox_int16[dst * 4U], box, 4U * sizeof(*box));
+                memcpy(result->class_string[dst], raw.class_string[i], UVC_AI_MAX_CLASS_LEN);
+                result->class_id[dst] = raw.class_id[i];
+                result->conf[dst] = raw.conf[i];
+                break;
+            }
+        }
+    }
+    g_previous_ball_result = raw;
+    g_previous_ball_tick = now;
+}
+
 static void uvc_ai_app_worker_thread_entry(void *parameter)
 {
     uvc_ai_result_t result;
@@ -553,39 +620,31 @@ static void uvc_ai_app_worker_thread_entry(void *parameter)
 
     (void)parameter;
 
-    while (g_uvc_ai_app.worker_running) {
-        if (rt_sem_take(g_uvc_ai_app.worker_sem, RT_WAITING_FOREVER) != RT_EOK) {
+    while (1) {
+        if (rt_sem_take(&g_uvc_ai_worker_wake, RT_WAITING_FOREVER) != RT_EOK) {
             continue;
         }
 
-        if (!g_uvc_ai_app.worker_running) {
-            break;
-        }
-
-        if ((!g_uvc_ai_app.ai_ready) || (g_uvc_ai_app.worker_frame_buf == RT_NULL)) {
+        if (!g_uvc_ai_app.worker_running || !g_uvc_ai_app.ai_ready) {
             g_uvc_ai_app.worker_busy = RT_FALSE;
             continue;
         }
 
-        ret = uvc_ai_process_yuyv(g_uvc_ai_app.worker_frame_buf,
+        ret = uvc_ai_process_yuyv(g_uvc_ai_worker_frame,
                                   UVC_AI_FRAME_BYTES,
                                   &result);
-        if (ret == RT_EOK) {
-            uvc_ai_app_publish_result(&result);
-        } else {
-            USB_LOG_WRN("AI processing failed\r\n");
-            uvc_ai_reset_result(&result);
+        if (g_uvc_ai_app.worker_running) {
+            if (ret != RT_EOK) {
+                USB_LOG_WRN("AI processing failed\r\n");
+                uvc_ai_reset_result(&result);
+            }
+            if (uvc_ai_get_mode() == UVC_AI_MODE_STEEL_BALL)
+                uvc_ai_confirm_balls(&result);
             uvc_ai_app_publish_result(&result);
         }
 
         g_uvc_ai_app.worker_busy = RT_FALSE;
     }
-}
-
-static void uvc_ai_app_worker_cleanup(struct rt_thread *thread)
-{
-    (void)thread;
-    g_uvc_ai_worker_reaped = RT_TRUE;
 }
 
 /* Alert flash: show red warning for 2 seconds after danger trigger */
@@ -594,10 +653,31 @@ static rt_tick_t  g_alert_flash_end = 0;
 /* Persistence filter: closed eye must be continuously detected for g_persist_target_ms */
 static rt_tick_t  g_closed_eye_start_tick = 0;
 static rt_bool_t  g_alert_sent_this_cycle = RT_FALSE;
+static rt_bool_t  g_closed_eye_tracking;
+static rt_tick_t  g_last_closed_eye_tick;
+static uint32_t   g_last_fatigue_seq;
 static uint32_t   g_persist_target_ms = 1500U;
 
 /* Shared telemetry snapshot for LVGL UI, HTTP /api/status, and CM33 IPC */
 static uvc_ai_telemetry_t g_ai_telemetry;
+
+static void uvc_ai_app_reset_tracking(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    g_alert_flash_end = 0;
+    g_closed_eye_tracking = RT_FALSE;
+    g_alert_sent_this_cycle = RT_FALSE;
+    rt_memset(&g_ai_telemetry, 0, sizeof(g_ai_telemetry));
+    uvc_ai_reset_result(&g_uvc_ai_app.latest_result);
+    uvc_ai_reset_result(&g_previous_ball_result);
+    rt_hw_interrupt_enable(level);
+}
+
+static rt_bool_t uvc_ai_alert_visible(uvc_ai_mode_t mode, rt_tick_t now)
+{
+    return mode == UVC_AI_MODE_FATIGUE &&
+           g_alert_flash_end != 0U && (rt_int32_t)(g_alert_flash_end - now) > 0;
+}
 
 void uvc_ai_app_set_persist_ms(uint32_t ms)
 {
@@ -618,42 +698,103 @@ void uvc_ai_app_get_telemetry(uvc_ai_telemetry_t *out)
 
     level = rt_hw_interrupt_disable();
     *out = g_ai_telemetry;
-    rt_hw_interrupt_enable(level);
-
     out->running = g_uvc_ai_app.started;
     out->ai_ready = g_uvc_ai_app.ai_ready;
+    out->mode = uvc_ai_get_mode();
     out->persist_target_ms = g_persist_target_ms;
+    out->alert_active = uvc_ai_alert_visible(out->mode, rt_tick_get());
+    rt_hw_interrupt_enable(level);
     out->danger_count = alert_get_danger_count();
-    out->alert_active = (g_alert_flash_end > 0 && rt_tick_get() < g_alert_flash_end) ? RT_TRUE : RT_FALSE;
 }
 
-static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *user_ctx)
+uvc_ai_mode_t uvc_ai_app_get_mode(void)
+{
+    return uvc_ai_get_mode();
+}
+
+static int uvc_ai_app_init_model(void)
+{
+    uvc_ai_config_t config = {
+        .initialized = 1U,
+        .src_width = g_uvc_ai_app.src_width,
+        .src_height = g_uvc_ai_app.src_height,
+    };
+    int ret = uvc_ai_init(&config);
+    g_uvc_ai_app.ai_ready = ret == RT_EOK;
+    g_uvc_ai_app.worker_running = g_uvc_ai_app.ai_ready;
+    return ret;
+}
+
+int uvc_ai_app_set_mode(uvc_ai_mode_t mode)
+{
+    uvc_ai_mode_t target = (mode == UVC_AI_MODE_STEEL_BALL)
+                           ? UVC_AI_MODE_STEEL_BALL
+                           : UVC_AI_MODE_FATIGUE;
+
+    int ret = RT_EOK;
+    rt_mutex_take(&g_uvc_ai_lifecycle, RT_WAITING_FOREVER);
+    if (uvc_ai_get_mode() == target) {
+        if (g_uvc_ai_app.started && !g_uvc_ai_app.ai_ready)
+            ret = uvc_ai_app_init_model();
+        rt_mutex_release(&g_uvc_ai_lifecycle);
+        return ret;
+    }
+
+    if (g_uvc_ai_app.started) {
+        rt_tick_t start = rt_tick_get();
+
+        g_uvc_ai_app.worker_running = RT_FALSE;
+        while (g_uvc_ai_app.worker_busy) {
+            if ((rt_tick_t)(rt_tick_get() - start) >= rt_tick_from_millisecond(500)) {
+                g_uvc_ai_app.worker_running = g_uvc_ai_app.ai_ready;
+                rt_mutex_release(&g_uvc_ai_lifecycle);
+                return -RT_ETIMEOUT;
+            }
+            rt_thread_mdelay(5);
+        }
+
+        if (g_uvc_ai_app.ai_ready) {
+            g_uvc_ai_app.ai_ready = RT_FALSE;
+            uvc_ai_deinit();
+        }
+    }
+
+    uvc_ai_app_reset_tracking();
+    uvc_ai_set_mode(target);
+    if (g_uvc_ai_app.started)
+        ret = uvc_ai_app_init_model();
+    rt_mutex_release(&g_uvc_ai_lifecycle);
+    if (ret == RT_EOK)
+        USB_LOG_INFO("AI mode switched to %s\r\n",
+                     (target == UVC_AI_MODE_STEEL_BALL) ? "steel_ball" : "fatigue");
+    else
+        USB_LOG_ERR("AI mode switch init failed: %d\r\n", ret);
+    return ret;
+}
+
+static void uvc_ai_app_overlay(const uvc_display_overlay_info_t *info)
 {
     uvc_ai_result_t result_snapshot;
     const uvc_ai_result_t *result = &result_snapshot;
     uint8_t det_count;
     uint32_t i;
-    char model_text[24];
+    char model_text[32];
     float   max_closed_conf = 0.0f;
+    float   max_det_conf = 0.0f;
     float   thresh = alert_get_threshold();
     uint32_t persist_ms = 0U;
+    rt_tick_t result_tick;
+    uvc_ai_mode_t mode = uvc_ai_get_mode();
+
+    uint32_t seq = uvc_ai_app_snapshot_result(&result_snapshot, &result_tick);
     rt_tick_t now = rt_tick_get();
-
-    (void)user_ctx;
-
-    if ((info == RT_NULL) || (!g_uvc_ai_app.started) || (!g_uvc_ai_app.ai_ready)) {
-        return;
-    }
-
-    uvc_ai_app_snapshot_result(&result_snapshot);
-    if (!result->valid) {
+    if (!result->valid ||
+        (rt_tick_t)(now - result_tick) >= rt_tick_from_millisecond(UVC_AI_RESULT_MAX_AGE_MS)) {
         rt_base_t level = rt_hw_interrupt_disable();
-        g_ai_telemetry.det_count = 0U;
-        g_ai_telemetry.max_closed_conf = 0.0f;
-        g_ai_telemetry.risk_level = UVC_AI_RISK_LOW;
-        g_ai_telemetry.persist_ms = 0U;
-        g_ai_telemetry.inference_ms = 0.0f;
+        rt_memset(&g_ai_telemetry, 0, sizeof(g_ai_telemetry));
         rt_hw_interrupt_enable(level);
+        g_closed_eye_tracking = RT_FALSE;
+        g_alert_sent_this_cycle = RT_FALSE;
         return;
     }
 
@@ -665,9 +806,13 @@ static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *
     for (i = 0U; i < det_count; i++) {
         const int16_t *bbox = &result->bbox_int16[i * 4U];
         int16_t x0 = uvc_ai_app_map_x_to_lcd(info, bbox[0]);
-        int16_t y0 = uvc_ai_app_map_y_to_lcd(info, bbox[1]);
+        int16_t y0 = (mode == UVC_AI_MODE_STEEL_BALL)
+                     ? uvc_ai_app_map_cam_y_to_lcd(info, bbox[1])
+                     : uvc_ai_app_map_y_to_lcd(info, bbox[1]);
         int16_t x1 = uvc_ai_app_map_x_to_lcd(info, bbox[2]);
-        int16_t y1 = uvc_ai_app_map_y_to_lcd(info, bbox[3]);
+        int16_t y1 = (mode == UVC_AI_MODE_STEEL_BALL)
+                     ? uvc_ai_app_map_cam_y_to_lcd(info, bbox[3])
+                     : uvc_ai_app_map_y_to_lcd(info, bbox[3]);
         uint16_t color;
         char label_text[UVC_AI_LABEL_MAX_LEN];
         int16_t label_y;
@@ -684,29 +829,39 @@ static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *
             y1 = tmp;
         }
 
-        /* Classify Closed Eye detections into 3 risk levels */
-        is_closed_eye = (uint8_t)(strncmp(result->class_string[i], "Closed", 6U) == 0);
+        if (result->conf[i] > max_det_conf) {
+            max_det_conf = result->conf[i];
+        }
 
-        if (is_closed_eye) {
-            uint8_t risk_level = uvc_ai_get_risk_level(result->conf[i]);
-
-            /* 跟踪最大闭眼置信度 */
-            if (result->conf[i] > max_closed_conf)
-                max_closed_conf = result->conf[i];
-
-            color = g_uvc_ai_risk_colors[risk_level];
-            (void)snprintf(label_text, sizeof(label_text), "%s %s %.0f%%",
-                           g_uvc_ai_risk_labels[risk_level],
-                           result->class_string[i],
+        if (mode == UVC_AI_MODE_STEEL_BALL) {
+            color = UVC_RGB565(16, 220, 120);
+            (void)snprintf(label_text, sizeof(label_text), "BALL %.0f%%",
                            result->conf[i] * 100.0f);
         } else {
-            if (result->class_id[i] < UVC_AI_NUM_CLASSES) {
-                color = g_uvc_ai_class_colors[result->class_id[i]];
+            /* Classify Closed Eye detections into 3 risk levels */
+            is_closed_eye = (uint8_t)(strncmp(result->class_string[i], "Closed", 6U) == 0);
+
+            if (is_closed_eye) {
+                uint8_t risk_level = uvc_ai_get_risk_level(result->conf[i]);
+
+                /* 跟踪最大闭眼置信度 */
+                if (result->conf[i] > max_closed_conf)
+                    max_closed_conf = result->conf[i];
+
+                color = g_uvc_ai_risk_colors[risk_level];
+                (void)snprintf(label_text, sizeof(label_text), "%s %s %.0f%%",
+                               g_uvc_ai_risk_labels[risk_level],
+                               result->class_string[i],
+                               result->conf[i] * 100.0f);
             } else {
-                color = g_uvc_ai_unknown_color;
+                if (result->class_id[i] < UVC_AI_NUM_CLASSES) {
+                    color = g_uvc_ai_class_colors[result->class_id[i]];
+                } else {
+                    color = g_uvc_ai_unknown_color;
+                }
+                (void)snprintf(label_text, sizeof(label_text), "%s %.0f%%",
+                               result->class_string[i], result->conf[i] * 100.0f);
             }
-            (void)snprintf(label_text, sizeof(label_text), "%s %.0f%%",
-                           result->class_string[i], result->conf[i] * 100.0f);
         }
 
         uvc_ai_app_draw_rect(info, x0, y0, x1, y1, color, UVC_AI_BOX_THICKNESS);
@@ -718,7 +873,12 @@ static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *
         uvc_ai_app_draw_text_box(info, x0, label_y, label_text, color, g_uvc_ai_text_color);
     }
 
-    (void)snprintf(model_text, sizeof(model_text), "Model %.1f ms", result->inference_ms);
+    if (mode == UVC_AI_MODE_STEEL_BALL) {
+        (void)snprintf(model_text, sizeof(model_text), "BALLS:%u %.1fms",
+                       (unsigned)det_count, result->inference_ms);
+    } else {
+        (void)snprintf(model_text, sizeof(model_text), "Model %.1f ms", result->inference_ms);
+    }
     uvc_ai_app_draw_text_box(info, 4, (int16_t)(info->dst_y_offset + 4U),
                              model_text, g_uvc_ai_model_bg, g_uvc_ai_text_color);
 
@@ -744,28 +904,38 @@ static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *
 
     /*
      * Persistence filter: closed eye must be continuously detected for g_persist_target_ms
-     * before triggering an alert. Any frame below threshold resets the timer.
+     * before triggering an alert (Fatigue mode only).
      */
-    if (max_closed_conf >= thresh) {
-        if (g_closed_eye_start_tick == 0)
-            g_closed_eye_start_tick = now;
-        persist_ms = ((uint32_t)(now - g_closed_eye_start_tick)) * (1000U / RT_TICK_PER_SECOND);
-        if ((persist_ms >= g_persist_target_ms) && !g_alert_sent_this_cycle) {
+    if (mode == UVC_AI_MODE_FATIGUE && max_closed_conf >= thresh) {
+        if (!g_closed_eye_tracking || seq != g_last_fatigue_seq) {
+            if (!g_closed_eye_tracking ||
+                (rt_tick_t)(result_tick - g_last_closed_eye_tick) >=
+                rt_tick_from_millisecond(UVC_AI_RESULT_MAX_AGE_MS)) {
+                g_closed_eye_tracking = RT_TRUE;
+                g_closed_eye_start_tick = result_tick;
+                g_alert_sent_this_cycle = RT_FALSE;
+            }
+            g_last_closed_eye_tick = result_tick;
+            g_last_fatigue_seq = seq;
+        }
+        persist_ms = (uint32_t)(result_tick - g_closed_eye_start_tick) * (1000U / RT_TICK_PER_SECOND);
+        if (persist_ms >= g_persist_target_ms && !g_alert_sent_this_cycle) {
             alert_danger(max_closed_conf, g_aht_temp, g_aht_humi);
             g_alert_flash_end = now + rt_tick_from_millisecond(2000);
             g_alert_sent_this_cycle = RT_TRUE;
         }
     } else {
-        g_closed_eye_start_tick  = 0;
+        g_closed_eye_tracking = RT_FALSE;
         g_alert_sent_this_cycle = RT_FALSE;
-        persist_ms = 0U;
     }
 
     {
         rt_base_t level = rt_hw_interrupt_disable();
+        g_ai_telemetry.mode = mode;
         g_ai_telemetry.det_count = det_count;
         g_ai_telemetry.max_closed_conf = max_closed_conf;
-        g_ai_telemetry.risk_level = (max_closed_conf >= thresh)
+        g_ai_telemetry.max_det_conf = max_det_conf;
+        g_ai_telemetry.risk_level = (mode == UVC_AI_MODE_FATIGUE && max_closed_conf >= thresh)
                                     ? uvc_ai_get_risk_level(max_closed_conf)
                                     : UVC_AI_RISK_LOW;
         g_ai_telemetry.persist_ms = persist_ms;
@@ -773,8 +943,8 @@ static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *
         rt_hw_interrupt_enable(level);
     }
 
-    /* Danger flash for 2s: compact banner on 320x240 stage, large banner on 512x800 LCD */
-    if (g_alert_flash_end > 0 && now < g_alert_flash_end) {
+    /* Danger flash for 2s (Fatigue mode only) */
+    if (uvc_ai_alert_visible(mode, now)) {
         int16_t banner_y = (int16_t)info->dst_y_offset;
         if (info->lcd_width <= 360U) {
             int16_t banner_h = 44;
@@ -806,6 +976,16 @@ static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *
     }
 }
 
+static void uvc_ai_app_overlay_cb(const uvc_display_overlay_info_t *info, void *user_ctx)
+{
+    (void)user_ctx;
+    if (info == RT_NULL || rt_mutex_take(&g_uvc_ai_lifecycle, 0) != RT_EOK)
+        return;
+    if (g_uvc_ai_app.started && g_uvc_ai_app.ai_ready && g_uvc_ai_app.worker_running)
+        uvc_ai_app_overlay(info);
+    rt_mutex_release(&g_uvc_ai_lifecycle);
+}
+
 void uvc_ai_app_enforce_mode(uint8_t *fmt, uint16_t *width, uint16_t *height)
 {
     if ((fmt == RT_NULL) || (width == RT_NULL) || (height == RT_NULL)) {
@@ -827,153 +1007,85 @@ void uvc_ai_app_enforce_mode(uint8_t *fmt, uint16_t *width, uint16_t *height)
 
 int uvc_ai_app_start(uint16_t src_width, uint16_t src_height)
 {
-    uvc_ai_config_t config;
     int ret;
-    rt_err_t thread_ret;
-
+    rt_mutex_take(&g_uvc_ai_lifecycle, RT_WAITING_FOREVER);
+    if (g_uvc_ai_app.started) {
+        rt_mutex_release(&g_uvc_ai_lifecycle);
+        return -RT_EBUSY;
+    }
+    if (!g_uvc_ai_worker_initialized) {
+        rt_sem_init(&g_uvc_ai_worker_wake, UVC_AI_WORKER_NAME, 0, RT_IPC_FLAG_FIFO);
+        ret = rt_thread_init(&g_uvc_ai_worker_tcb, UVC_AI_WORKER_NAME,
+                            uvc_ai_app_worker_thread_entry, RT_NULL,
+                            g_uvc_ai_worker_stack, sizeof(g_uvc_ai_worker_stack),
+                            UVC_AI_WORKER_PRIORITY, UVC_AI_WORKER_TICK);
+        if (ret != RT_EOK) {
+            rt_sem_detach(&g_uvc_ai_worker_wake);
+            rt_mutex_release(&g_uvc_ai_lifecycle);
+            return ret;
+        }
+        g_uvc_ai_worker_initialized = RT_TRUE;
+        rt_thread_startup(&g_uvc_ai_worker_tcb);
+    }
     memset(&g_uvc_ai_app, 0, sizeof(g_uvc_ai_app));
     g_uvc_ai_app.src_width = src_width ? src_width : UVC_AI_CAMERA_WIDTH;
     g_uvc_ai_app.src_height = src_height ? src_height : UVC_AI_CAMERA_HEIGHT;
     g_uvc_ai_app.started = RT_TRUE;
 
-    uvc_ai_reset_result(&g_uvc_ai_app.latest_result);
-
-    config.initialized = 1U;
-    config.src_width = g_uvc_ai_app.src_width;
-    config.src_height = g_uvc_ai_app.src_height;
-
-    ret = uvc_ai_init(&config);
+    uvc_ai_app_reset_tracking();
+    uvc_display_set_overlay_callback(uvc_ai_app_overlay_cb, RT_NULL);
+    ret = uvc_ai_app_init_model();
+    rt_mutex_release(&g_uvc_ai_lifecycle);
     if (ret != RT_EOK) {
         USB_LOG_ERR("AI init failed, render-only mode\r\n");
         return RT_EOK;
     }
 
-    g_uvc_ai_app.ai_ready = RT_TRUE;
-    g_uvc_ai_app.worker_frame_buf = rt_malloc(UVC_AI_FRAME_BYTES);
-    if (g_uvc_ai_app.worker_frame_buf != RT_NULL) {
-        g_uvc_ai_app.worker_sem = rt_sem_create("uvc_aiwk", 0, RT_IPC_FLAG_FIFO);
-        if (g_uvc_ai_app.worker_sem != RT_NULL) {
-            g_uvc_ai_app.worker_running = RT_TRUE;
-            g_uvc_ai_app.worker_busy = RT_FALSE;
-            thread_ret = rt_thread_init(&g_uvc_ai_worker_tcb,
-                                        UVC_AI_WORKER_NAME,
-                                        uvc_ai_app_worker_thread_entry,
-                                        RT_NULL,
-                                        g_uvc_ai_worker_stack,
-                                        sizeof(g_uvc_ai_worker_stack),
-                                        UVC_AI_WORKER_PRIORITY,
-                                        UVC_AI_WORKER_TICK);
-            if (thread_ret == RT_EOK) {
-                g_uvc_ai_app.worker_thread = &g_uvc_ai_worker_tcb;
-                g_uvc_ai_worker_reaped = RT_FALSE;
-                g_uvc_ai_worker_tcb.cleanup = uvc_ai_app_worker_cleanup;
-                rt_thread_startup(g_uvc_ai_app.worker_thread);
-            } else {
-                g_uvc_ai_app.worker_thread = RT_NULL;
-                g_uvc_ai_app.worker_running = RT_FALSE;
-                rt_sem_delete(g_uvc_ai_app.worker_sem);
-                g_uvc_ai_app.worker_sem = RT_NULL;
-                USB_LOG_WRN("AI worker thread init failed (%d), fallback to sync\r\n", thread_ret);
-            }
-        } else {
-            USB_LOG_WRN("AI worker semaphore create failed, fallback to sync\r\n");
-        }
-    } else {
-        USB_LOG_WRN("AI worker buffer alloc failed, fallback to sync\r\n");
-    }
-
-    if ((g_uvc_ai_app.worker_thread == RT_NULL) || (g_uvc_ai_app.worker_sem == RT_NULL)) {
-        if (g_uvc_ai_app.worker_sem != RT_NULL) {
-            rt_sem_delete(g_uvc_ai_app.worker_sem);
-            g_uvc_ai_app.worker_sem = RT_NULL;
-        }
-        if (g_uvc_ai_app.worker_frame_buf != RT_NULL) {
-            rt_free(g_uvc_ai_app.worker_frame_buf);
-            g_uvc_ai_app.worker_frame_buf = RT_NULL;
-        }
-    }
-
-    uvc_display_set_overlay_callback(uvc_ai_app_overlay_cb, RT_NULL);
-    USB_LOG_INFO("AI app started (%s)\r\n",
-                 (g_uvc_ai_app.worker_thread != RT_NULL) ? "async" : "sync");
+    USB_LOG_INFO("AI app started (async)\r\n");
 
     return RT_EOK;
 }
 
 void uvc_ai_app_process_frame(const struct usbh_videoframe *frame)
 {
-    int ret;
-
-    if ((!g_uvc_ai_app.started) || (!g_uvc_ai_app.ai_ready) || (frame == RT_NULL)) {
-        return;
-    }
-
-    if (frame->frame_format != USBH_VIDEO_FORMAT_UNCOMPRESSED) {
+    if (frame == RT_NULL || frame->frame_buf == RT_NULL ||
+        frame->frame_format != USBH_VIDEO_FORMAT_UNCOMPRESSED ||
+        frame->frame_size < UVC_AI_FRAME_BYTES ||
+        rt_mutex_take(&g_uvc_ai_lifecycle, 0) != RT_EOK) {
         return;
     }
 
     g_uvc_ai_app.frame_counter++;
-    if ((g_uvc_ai_app.frame_counter % UVC_AI_FRAMES_TO_SKIP) != 0U) {
+    if (!g_uvc_ai_app.worker_running || g_uvc_ai_app.worker_busy ||
+        (g_uvc_ai_app.frame_counter % UVC_AI_FRAMES_TO_SKIP) != 0U) {
+        rt_mutex_release(&g_uvc_ai_lifecycle);
         return;
     }
-
-    if ((g_uvc_ai_app.worker_thread != RT_NULL) &&
-        (g_uvc_ai_app.worker_sem != RT_NULL) &&
-        (g_uvc_ai_app.worker_frame_buf != RT_NULL)) {
-        if (frame->frame_size < UVC_AI_FRAME_BYTES) {
-            return;
-        }
-
-        if (g_uvc_ai_app.worker_busy) {
-            return;
-        }
-
-        g_uvc_ai_app.worker_busy = RT_TRUE;
-        memcpy(g_uvc_ai_app.worker_frame_buf, frame->frame_buf, UVC_AI_FRAME_BYTES);
-        if (rt_sem_release(g_uvc_ai_app.worker_sem) != RT_EOK) {
-            g_uvc_ai_app.worker_busy = RT_FALSE;
-        }
-        return;
-    }
-
-    ret = uvc_ai_process_yuyv(frame->frame_buf, frame->frame_size, &g_uvc_ai_app.latest_result);
-    if (ret != RT_EOK) {
-        USB_LOG_WRN("AI processing failed\r\n");
-    }
+    g_uvc_ai_app.worker_busy = RT_TRUE;
+    rt_mutex_release(&g_uvc_ai_lifecycle);
+    memcpy(g_uvc_ai_worker_frame, frame->frame_buf, UVC_AI_FRAME_BYTES);
+    if (rt_sem_release(&g_uvc_ai_worker_wake) != RT_EOK)
+        g_uvc_ai_app.worker_busy = RT_FALSE;
 }
 
-void uvc_ai_app_stop(void)
+int uvc_ai_app_stop(void)
 {
+    rt_mutex_take(&g_uvc_ai_lifecycle, RT_WAITING_FOREVER);
     if (!g_uvc_ai_app.started) {
-        return;
+        rt_mutex_release(&g_uvc_ai_lifecycle);
+        return RT_EOK;
     }
 
     uvc_display_set_overlay_callback(RT_NULL, RT_NULL);
-
-    if (g_uvc_ai_app.worker_thread != RT_NULL) {
-        g_uvc_ai_app.worker_running = RT_FALSE;
-        if (g_uvc_ai_app.worker_sem != RT_NULL) {
-            (void)rt_sem_release(g_uvc_ai_app.worker_sem);
+    g_uvc_ai_app.worker_running = RT_FALSE;
+    rt_tick_t start = rt_tick_get();
+    while (g_uvc_ai_app.worker_busy) {
+        if ((rt_tick_t)(rt_tick_get() - start) >= rt_tick_from_millisecond(250)) {
+            rt_mutex_release(&g_uvc_ai_lifecycle);
+            return -RT_ETIMEOUT;
         }
-
-        /* The idle thread detaches the worker after it returns. Its cleanup
-         * callback signals that the static TCB and stack can be reused. */
-        while (!g_uvc_ai_worker_reaped) {
-            rt_thread_mdelay(1);
-        }
-        g_uvc_ai_app.worker_thread = RT_NULL;
+        rt_thread_mdelay(5);
     }
-
-    if (g_uvc_ai_app.worker_sem != RT_NULL) {
-        rt_sem_delete(g_uvc_ai_app.worker_sem);
-        g_uvc_ai_app.worker_sem = RT_NULL;
-    }
-
-    if (g_uvc_ai_app.worker_frame_buf != RT_NULL) {
-        rt_free(g_uvc_ai_app.worker_frame_buf);
-        g_uvc_ai_app.worker_frame_buf = RT_NULL;
-    }
-    g_uvc_ai_app.worker_busy = RT_FALSE;
 
     if (g_uvc_ai_app.ai_ready) {
         uvc_ai_deinit();
@@ -981,10 +1093,182 @@ void uvc_ai_app_stop(void)
     }
 
     g_uvc_ai_app.started = RT_FALSE;
-    g_closed_eye_start_tick = 0;
-    g_alert_sent_this_cycle = RT_FALSE;
-    g_alert_flash_end = 0;
-    rt_memset(&g_ai_telemetry, 0, sizeof(g_ai_telemetry));
-    uvc_ai_reset_result(&g_uvc_ai_app.latest_result);
+    uvc_ai_app_reset_tracking();
+    rt_mutex_release(&g_uvc_ai_lifecycle);
     USB_LOG_INFO("AI app stopped\r\n");
+    return RT_EOK;
 }
+
+static int cmd_ai_mode(int argc, char **argv)
+{
+    if (argc >= 2) {
+        if (strcmp(argv[1], "steel_ball") == 0 || strcmp(argv[1], "ball") == 0) {
+            int r = uvc_ai_app_set_mode(UVC_AI_MODE_STEEL_BALL);
+            rt_kprintf("ai_mode=steel_ball ret=%d\n", r);
+            return r;
+        }
+        if (strcmp(argv[1], "fatigue") == 0 || strcmp(argv[1], "eye") == 0) {
+            int r = uvc_ai_app_set_mode(UVC_AI_MODE_FATIGUE);
+            rt_kprintf("ai_mode=fatigue ret=%d\n", r);
+            return r;
+        }
+    }
+    rt_kprintf("ai_mode=%s running=%d ai_ready=%d thresh=%.2f\n",
+               (uvc_ai_app_get_mode() == UVC_AI_MODE_STEEL_BALL) ? "steel_ball" : "fatigue",
+               g_uvc_ai_app.started ? 1 : 0,
+               g_uvc_ai_app.ai_ready ? 1 : 0,
+               (double)uvc_ai_get_conf_threshold());
+    return 0;
+}
+MSH_CMD_EXPORT_ALIAS(cmd_ai_mode, ai_mode, Switch/query AI detection mode [fatigue|steel_ball|status]);
+
+static void fill_synth_steel_ball_yuyv(uint8_t *yuyv)
+{
+    uint32_t y;
+    uint32_t x;
+    const float cx = 199.0f;
+    const float cy = 180.0f;
+    const float r = 17.0f;
+    const float r2 = r * r;
+
+    for (y = 0U; y < UVC_AI_CAMERA_HEIGHT; y++) {
+        uint8_t *row = yuyv + y * (UVC_AI_CAMERA_WIDTH * 2U);
+        for (x = 0U; x < UVC_AI_CAMERA_WIDTH; x += 2U) {
+            uint32_t px;
+            uint8_t luma[2];
+            for (px = 0U; px < 2U; px++) {
+                float fx = (float)(x + px);
+                float fy = (float)y;
+                float dx = fx - cx;
+                float dy = fy - cy;
+                float d2 = dx * dx + dy * dy;
+                int32_t val;
+
+                if (d2 <= r2) {
+                    float nx = dx / r;
+                    float ny = dy / r;
+                    float nz = sqrtf(fmaxf(0.0f, 1.0f - nx * nx - ny * ny));
+                    float diff = fmaxf(0.0f, nx * (-0.40f) + ny * (-0.50f) + nz * 0.76f);
+                    float spec_base = fmaxf(0.0f, nx * (-0.25f) + ny * (-0.32f) + nz * 0.91f);
+                    float spec = powf(spec_base, 24.0f);
+                    val = (int32_t)(45.0f + 150.0f * diff + 220.0f * spec);
+                } else {
+                    val = 140 + (((int32_t)(x + px) * 40) / 320) - 20;
+                }
+                if (val < 0) val = 0;
+                if (val > 255) val = 255;
+                luma[px] = (uint8_t)val;
+            }
+            row[x * 2U + 0U] = luma[0];
+            row[x * 2U + 1U] = 128U;
+            row[x * 2U + 2U] = luma[1];
+            row[x * 2U + 3U] = 128U;
+        }
+    }
+}
+
+typedef struct {
+    struct rt_semaphore done;
+    int ret;
+} ai_selftest_ctx_t;
+
+static void ai_selftest_thread_entry(void *param)
+{
+    ai_selftest_ctx_t *ctx = (ai_selftest_ctx_t *)param;
+    uvc_ai_config_t cfg;
+    uvc_ai_result_t res;
+    int ret;
+    uint8_t i;
+
+    cfg.initialized = 1U;
+    cfg.src_width = UVC_AI_CAMERA_WIDTH;
+    cfg.src_height = UVC_AI_CAMERA_HEIGHT;
+
+    ret = uvc_ai_init(&cfg);
+    if (ret != RT_EOK) {
+        rt_kprintf("ai_selftest: init failed (%d)\n", ret);
+        ctx->ret = ret;
+        rt_sem_release(&ctx->done);
+        return;
+    }
+
+    fill_synth_steel_ball_yuyv(g_uvc_ai_worker_frame);
+    ret = uvc_ai_process_yuyv(g_uvc_ai_worker_frame, UVC_AI_FRAME_BYTES, &res);
+    if (ret == RT_EOK && uvc_ai_get_mode() == UVC_AI_MODE_STEEL_BALL) {
+        uvc_ai_result_t sample;
+        for (unsigned int trial = 0; trial < 4U; trial++) {
+            memset(g_uvc_ai_worker_frame, 128, UVC_AI_FRAME_BYTES);
+            ret = uvc_ai_process_yuyv(g_uvc_ai_worker_frame, UVC_AI_FRAME_BYTES, &sample);
+            if (ret != RT_EOK || sample.count != 0U) {
+                rt_kprintf("ai_selftest: blank frame check failed (trial=%u)\n", trial + 1U);
+                ret = -RT_ERROR;
+                break;
+            }
+            fill_synth_steel_ball_yuyv(g_uvc_ai_worker_frame);
+            ret = uvc_ai_process_yuyv(g_uvc_ai_worker_frame, UVC_AI_FRAME_BYTES, &sample);
+            if (ret != RT_EOK || sample.count != res.count ||
+                memcmp(res.bbox_int16, sample.bbox_int16, sizeof(res.bbox_int16)) != 0 ||
+                memcmp(res.conf, sample.conf, sizeof(res.conf)) != 0) {
+                rt_kprintf("ai_selftest: repeated frame check failed (trial=%u)\n", trial + 1U);
+                ret = -RT_ERROR;
+                break;
+            }
+        }
+        if (ret == RT_EOK)
+            rt_kprintf("ai_selftest: 4 alternating blank/target frames passed\n");
+    }
+    uvc_ai_deinit();
+
+    if (ret != RT_EOK) {
+        rt_kprintf("ai_selftest: infer failed (%d)\n", ret);
+        ctx->ret = ret;
+        rt_sem_release(&ctx->done);
+        return;
+    }
+
+    rt_kprintf("ai_selftest: mode=%s inf=%.1fms det=%u\n",
+               (uvc_ai_get_mode() == UVC_AI_MODE_STEEL_BALL) ? "steel_ball" : "fatigue",
+               (double)res.inference_ms, (unsigned)res.count);
+    for (i = 0U; i < res.count; i++) {
+        rt_kprintf("  #%u %s %.1f%% [%d,%d,%d,%d]\n",
+                   (unsigned)i, res.class_string[i], (double)(res.conf[i] * 100.0f),
+                   res.bbox_int16[i * 4U + 0U], res.bbox_int16[i * 4U + 1U],
+                   res.bbox_int16[i * 4U + 2U], res.bbox_int16[i * 4U + 3U]);
+    }
+    ctx->ret = RT_EOK;
+    rt_sem_release(&ctx->done);
+}
+
+static int cmd_ai_selftest(int argc, char **argv)
+{
+    ai_selftest_ctx_t ctx;
+    rt_thread_t tid;
+
+    (void)argc;
+    (void)argv;
+
+    rt_mutex_take(&g_uvc_ai_lifecycle, RT_WAITING_FOREVER);
+    if (g_uvc_ai_app.started) {
+        rt_mutex_release(&g_uvc_ai_lifecycle);
+        rt_kprintf("ai_selftest: busy (camera running)\n");
+        return -RT_EBUSY;
+    }
+
+    rt_sem_init(&ctx.done, "aiselft", 0, RT_IPC_FLAG_FIFO);
+    ctx.ret = -RT_ERROR;
+
+    tid = rt_thread_create("ai_test", ai_selftest_thread_entry, &ctx,
+                           16384, UVC_AI_WORKER_PRIORITY, UVC_AI_WORKER_TICK);
+    if (tid == RT_NULL) {
+        rt_sem_detach(&ctx.done);
+        rt_mutex_release(&g_uvc_ai_lifecycle);
+        rt_kprintf("ai_selftest: thread create failed\n");
+        return -RT_ENOMEM;
+    }
+    rt_thread_startup(tid);
+    rt_sem_take(&ctx.done, RT_WAITING_FOREVER);
+    rt_sem_detach(&ctx.done);
+    rt_mutex_release(&g_uvc_ai_lifecycle);
+    return ctx.ret;
+}
+MSH_CMD_EXPORT_ALIAS(cmd_ai_selftest, ai_selftest, Run one-shot AI NPU self-test in active mode);

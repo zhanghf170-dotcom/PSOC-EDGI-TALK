@@ -203,6 +203,21 @@ static rt_size_t ST7102_read_point(struct rt_touch_device *touch, void *buf, rt_
     static uint16_t Last_Touch_Intn = 0;
     static uint16_t Touch_Intn = 0;
 
+    /* Skip idle software-I2C 40-byte reads when IRQ is inactive and no finger is down */
+    rt_bool_t any_down = RT_FALSE;
+    for (rt_size_t i = 0; i < ST7102_MAX_TOUCH; i++)
+    {
+        if (s_tp_dowm[i] != 0)
+        {
+            any_down = RT_TRUE;
+            break;
+        }
+    }
+    if (!any_down && !ST7102_irq_is_active())
+    {
+        return 0;
+    }
+
     cmd[0] = (rt_uint8_t)((ST7102_Read_Start_Position >> 8) & 0xFF);
     cmd[1] = (rt_uint8_t)(ST7102_Read_Start_Position & 0xFF);
 

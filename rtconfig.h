@@ -200,10 +200,12 @@
 /* Network */
 
 #define RT_USING_SAL
+#define SAL_INTERNET_CHECK
 
 /* Docking with protocol stacks */
 
 #define SAL_USING_LWIP
+#define SAL_USING_TLS
 /* end of Docking with protocol stacks */
 #define SAL_USING_POSIX
 #define RT_USING_NETDEV
@@ -239,11 +241,11 @@
 #define RT_LWIP_UDP_PCB_NUM 8
 #define RT_LWIP_TCP_PCB_NUM 16
 #define RT_LWIP_TCP_SEG_NUM 128
-#define RT_LWIP_TCP_SND_BUF 24000
+#define RT_LWIP_TCP_SND_BUF 32000
 #define RT_LWIP_TCP_WND 24000
 #define RT_LWIP_TCPTHREAD_PRIORITY 10
-#define RT_LWIP_TCPTHREAD_MBOX_SIZE 16
-#define RT_LWIP_TCPTHREAD_STACKSIZE 4096
+#define RT_LWIP_TCPTHREAD_MBOX_SIZE 32
+#define RT_LWIP_TCPTHREAD_STACKSIZE 12288
 #define LWIP_NO_TX_THREAD
 #define RT_LWIP_ETHTHREAD_PRIORITY 11
 #define RT_LWIP_ETHTHREAD_STACKSIZE 2048
@@ -257,6 +259,10 @@
 #define LWIP_SO_LINGER 0
 #define LWIP_NETIF_LOOPBACK 0
 #define RT_LWIP_USING_PING
+#define RT_LWIP_USING_WEBSOCKET
+#define LWIP_ALTCP 1
+#define LWIP_ALTCP_TLS 1
+#define LWIP_ALTCP_TLS_MBEDTLS 1
 /* end of Network */
 
 /* Utilities */
@@ -271,6 +277,11 @@
 /* RT-Thread online packages */
 
 /* IoT - internet of things */
+
+#define PKG_USING_WEBCLIENT
+#define WEBCLIENT_USING_MBED_TLS
+#define PKG_USING_WEBCLIENT_V220
+#define PKG_WEBCLIENT_VER_NUM 0x20200
 
 
 /* Wi-Fi */
@@ -303,12 +314,20 @@
 
 /* security packages */
 
+#define PKG_USING_MBEDTLS
+#define PKG_USING_MBEDTLS_CERTUM_TRUSTED_NETWORK_ROOT_CA
+#define MBEDTLS_AES_ROM_TABLES
+#define MBEDTLS_ECP_WINDOW_SIZE 2
+#define MBEDTLS_SSL_MAX_CONTENT_LEN 16384
+#define PKG_USING_MBEDTLS_V2281
 /* end of security packages */
 
 /* language packages */
 
 /* JSON: JavaScript Object Notation, a lightweight data-interchange format */
 
+#define PKG_USING_CJSON
+#define PKG_USING_CJSON_V1717
 /* end of JSON: JavaScript Object Notation, a lightweight data-interchange format */
 
 /* XML: Extensible Markup Language */
@@ -536,8 +555,13 @@
 #define BSP_USING_USB_TO_UART
 #define BSP_USING_AUDIO
 #define BSP_USING_AUDIO_PLAY
+#define BSP_USING_AUDIO_RECORD
 #define BSP_USING_AHT20
 #define BSP_USING_DEEPCRAFT_AI
+#define BSP_USING_XIAOZHI_COCKPIT
+#define PKG_LIB_OPUS
+#define BSP_XIAOZHI_SOUND_DEVICE_NAME "sound0"
+#define BSP_XIAOZHI_MIC_DEVICE_NAME "mic0"
 /* end of Onboard Peripheral Drivers */
 
 /* On-chip Peripheral Drivers */
@@ -555,7 +579,7 @@
 #define BSP_USING_UART
 #define BSP_USING_UART2
 #define BSP_USING_HYPERAM
-#define BSP_USING_HYPERAM_SIZE 0x200000
+#define BSP_USING_HYPERAM_SIZE 0x400000
 #define BSP_USING_PWM
 #define BSP_USING_PWM18
 #define BSP_USING_SDIO
@@ -576,13 +600,13 @@
 /* WHD Configuration */
 
 #define WHD_SET_COUNTRY_FROM_HOST
-#define WHD_COUNTRY_CODE "CN"
+#define WHD_COUNTRY_CODE "AU"
 #define WHD_COUNTRY_CODE_REVISION 0
 #define CY_WIFI_USING_THREAD_INIT
 #define CY_WIFI_INIT_THREAD_PRIORITY 14
 #define CY_WIFI_INIT_THREAD_STACK_SIZE 3072
 #define CY_WIFI_WHD_THREAD_PRIORITY 7
-#define CY_WIFI_WHD_THREAD_STACK_SIZE 5120
+#define CY_WIFI_WHD_THREAD_STACK_SIZE 6144
 #define WHD_RESOURCES_IN_MEMORY
 #define WHD_RESOURCES_BLOCK_SIZE 1024
 #define WHD_USING_CHIP_CYW55500

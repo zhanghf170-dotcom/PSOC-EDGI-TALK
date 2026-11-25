@@ -9,6 +9,7 @@ src = Glob('*.c')
 path = [
     cwd,
     proj_root + '/applications',
+    proj_root + '/applications/xiaozhi',
     proj_root + '/libraries/Common/board/ports/usb',
     proj_root + '/libraries/Common/board/ports/lvgl',
     proj_root + '/libraries/Common/deepcraft_ai/include',

@@ -14,6 +14,7 @@
 #include <wavplayer.h>
 #include "alert_manager.h"
 #include "wifi_stream.h"
+#include "xiaozhi.h"
 
 #define DBG_TAG              "alert"
 #define DBG_LVL              DBG_INFO
@@ -161,17 +162,31 @@ static void alert_worker_entry(void *parameter)
 
         if (msg.type == ALERT_MSG_DANGER)
         {
+            xiaozhi_notify_fatigue_alert(msg.conf);
+            xiaozhi_audio_lock();
             wavplayer_volume_set(g_ctx.volume);
             (void)wavplayer_play(ALERT_WAV_PATH);
+            for (int w = 0; w < 60; w++)
+            {
+                rt_thread_mdelay(25);
+                if (wavplayer_state_get() == PLAYER_STATE_STOPED) break;
+            }
+            xiaozhi_audio_unlock();
+            /* Follow alarm tone with Gemini-chan cute female voice fatigue warning */
+            xiaozhi_speak_clip(XZ_VOICE_ALERT);
             alert_write_danger_log(msg.seq, msg.tick, msg.conf, msg.temp, msg.humi);
         }
         else if (msg.type == ALERT_MSG_TEST_SOUND)
         {
+            xiaozhi_audio_preempt_for_alarm();
+            xiaozhi_audio_lock();
             wavplayer_volume_set(g_ctx.volume);
             (void)wavplayer_play(ALERT_WAV_PATH);
+            xiaozhi_audio_unlock();
         }
         else if (msg.type == ALERT_MSG_STOP)
         {
+            xiaozhi_audio_preempt_for_alarm();
             (void)wavplayer_stop();
         }
     }

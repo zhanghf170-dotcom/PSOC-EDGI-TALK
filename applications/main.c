@@ -21,6 +21,7 @@
 #include "dualcore_bridge.h"
 #include "wifi_stream.h"
 #include "watch_info.h"
+#include "xiaozhi.h"
 #include "ui_manager.h"
 #include "aht10.h"
 
@@ -112,6 +113,7 @@ int main(void)
     dualcore_bridge_init();
     wifi_stream_init();
     watch_info_init();
+    xiaozhi_init();
 
     /* AHT20 sensor on i2c1 (SCL=P9.3, SDA=P9.2) */
     aht10_dev = aht10_init(PKG_AHT10_I2C_BUS_NAME);
@@ -132,15 +134,20 @@ int main(void)
     rt_pin_attach_irq(KEY_PIN, PIN_IRQ_MODE_FALLING, key_uvc_isr, RT_NULL);
     rt_pin_irq_enable(KEY_PIN, PIN_IRQ_ENABLE);
 
-    rt_kprintf("  KEY(P8.3) = toggle Fatigue UI  |  wifi_save / wifi_relay / ipc_ping / sdlist\n");
+    rt_kprintf("  KEY(P8.3)=Fatigue/Gemini Voice | xz_status / xz_talk / wifi_save / ipc_ping\n");
 
     int led_state = PIN_LOW;
     int tick_cnt = 0;
     while (1) {
         if (g_uvc_toggle_req) {
             g_uvc_toggle_req = 0;
-            rt_kprintf("[KEY] Toggle Fatigue Monitor UI\n");
-            ui_request_toggle_fatigue();
+            if (ui_get_active_screen() == UI_SCR_XIAOZHI) {
+                rt_kprintf("[KEY] Gemini-chan XiaoZhi Voice Trigger\n");
+                xiaozhi_trigger_talk();
+            } else {
+                rt_kprintf("[KEY] Toggle Fatigue Monitor UI\n");
+                ui_request_toggle_fatigue();
+            }
         }
 
         if (++tick_cnt >= 10) {

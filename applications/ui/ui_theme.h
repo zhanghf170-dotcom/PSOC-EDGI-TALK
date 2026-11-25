@@ -17,6 +17,10 @@ extern "C" {
 LV_FONT_DECLARE(ui_font_zh);
 #define UI_FONT_ZH (&ui_font_zh)
 
+/* Full GB2312 Level-1 TinyTTF fonts (fallback to Montserrat symbols) */
+const lv_font_t *ui_font_zh_full(void);
+const lv_font_t *ui_font_zh_small(void);
+
 /* Automotive Glassmorphism Dark Cockpit Palette */
 #define UI_COL_BG         lv_color_hex(0x0B0F1A)
 #define UI_COL_CARD       lv_color_hex(0x141C2E)
@@ -29,6 +33,13 @@ LV_FONT_DECLARE(ui_font_zh);
 #define UI_COL_AMBER      lv_color_hex(0xF59E0B)
 #define UI_COL_RED        lv_color_hex(0xEF4444)
 
+/* Gemini-chan Cosmic Palette */
+#define UI_COL_GEMINI_BLUE   lv_color_hex(0x60A5FA)
+#define UI_COL_GEMINI_PURPLE lv_color_hex(0xA78BFA)
+#define UI_COL_GEMINI_VIOLET lv_color_hex(0x7C3AED)
+#define UI_COL_GEMINI_PINK   lv_color_hex(0xF472B6)
+#define UI_COL_GEMINI_GOLD   lv_color_hex(0xFBBF24)
+
 typedef enum
 {
     UI_SCR_HOME = 0,
@@ -40,6 +51,8 @@ typedef enum
     UI_SCR_BRIGHTNESS,
     UI_SCR_GALLERY,
     UI_SCR_CAMERA,
+    UI_SCR_XIAOZHI,
+    UI_SCR_CLOCK_TOOLS,
     UI_SCR_COUNT
 } ui_screen_id_t;
 

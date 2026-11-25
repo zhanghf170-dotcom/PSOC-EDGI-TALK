@@ -138,7 +138,7 @@
 /* The stack size of the drawing thread.
  * NOTE: If FreeType or ThorVG is enabled, it is recommended to set it to 32KB or more.
  */
-#define LV_DRAW_THREAD_STACK_SIZE    (32 * 1024)   /*[bytes]*/
+#define LV_DRAW_THREAD_STACK_SIZE    (16 * 1024)   /*[bytes]*/
 
 #define LV_USE_DRAW_SW 1
 #if LV_USE_DRAW_SW == 1
@@ -259,11 +259,11 @@
     /* VG-Lite gradient maximum cache number.
      * NOTE: The memory usage of a single gradient image is 4K bytes.
      */
-    #define LV_VG_LITE_GRAD_CACHE_CNT 32
+    #define LV_VG_LITE_GRAD_CACHE_CNT 8
 
     /* VG-Lite stroke maximum cache number.
      */
-    #define LV_VG_LITE_STROKE_CACHE_CNT 32
+    #define LV_VG_LITE_STROKE_CACHE_CNT 8
 
 #endif
 
@@ -792,7 +792,7 @@
 #define LV_USE_GIF 1
 #if LV_USE_GIF
     /*GIF decoder accelerate*/
-    #define LV_GIF_CACHE_DECODE_DATA 1
+    #define LV_GIF_CACHE_DECODE_DATA 0
 #endif
 
 
@@ -820,11 +820,11 @@
 #endif
 
 /* Built-in TTF decoder */
-#define LV_USE_TINY_TTF 0
+#define LV_USE_TINY_TTF 1
 #if LV_USE_TINY_TTF
     /* Enable loading TTF data from files */
     #define LV_TINY_TTF_FILE_SUPPORT 0
-    #define LV_TINY_TTF_CACHE_GLYPH_CNT 256
+    #define LV_TINY_TTF_CACHE_GLYPH_CNT 128
 #endif
 
 /*Rlottie library*/

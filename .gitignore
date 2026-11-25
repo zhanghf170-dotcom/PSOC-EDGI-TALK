@@ -52,3 +52,14 @@ cconfig.h
 /tools/received_jpg/
 wifi.cfg
 *.log
+
+/packages/cJSON-v1.7.17/
+/packages/mbedtls-v2.28.1/
+/packages/opus-1.4/*
+!/packages/opus-1.4/SConscript
+/packages/webclient-v2.2.0/
+/resources/gemini/
+/resources/xiaozhi_ding.wav
+/resources/xiaozhi_zh_l1.ttf
+/reports/
+/tools/steel_ball_export/

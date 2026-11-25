@@ -1,5 +1,6 @@
 from building import *
 import os
+import re
 
 cwd = os.path.realpath(GetCurrentDir()).replace('\\', '/')
 project_root = Dir('#').abspath.replace('\\', '/')
@@ -14,6 +15,20 @@ ethosu_root = pdl_root + '/drivers/third_party/COMPONENT_U55'
 group = []
 
 if not GetDepend(['BSP_USING_DEEPCRAFT_AI']):
+    Return('group')
+
+model_h = os.path.join(cwd, 'model', 'model.h')
+model_c = os.path.join(cwd, 'model', 'model.c')
+has_eye_model = False
+if os.path.isfile(model_h) and os.path.isfile(model_c):
+    with open(model_h, encoding='utf-8-sig', errors='replace') as model_header:
+        has_eye_model = re.search(r'^\s*#define\s+IMAI_DATA_IN_COUNT\b',
+                                  model_header.read(), re.MULTILINE) is not None
+
+if not has_eye_model:
+    group = DefineGroup('DeepcraftAi', ['src/uvc_ai_unavailable.c'],
+                        depend=['RT_CHERRYUSB_HOST_VIDEO', 'BSP_USING_DEEPCRAFT_AI'],
+                        CPPPATH=[cwd + '/include', usb_port])
     Return('group')
 
 src = [
@@ -55,9 +70,14 @@ cpp_defines = [
     'ML_IMAGIMOB_CM55',
     'MODEL_NAME=OBJECT_DETECT',
     'TF_LITE_STATIC_MEMORY',
-    'CY_ML_MODEL_MEM=.cy_socmem_data',
-    'CY_ML_ARENA_MEM=.cy_socmem_data',
+    'CY_ML_ARENA_MEM=.cy_ml_arena_fast_data',
+    'CY_ML_WORKING_MEM=.cy_ml_arena_fast_data',
 ]
+
+steel_ball_files = ['model/steel_ball_model.c', 'model/steel_ball_model.h']
+if all(os.path.isfile(os.path.join(cwd, name)) for name in steel_ball_files):
+    src.append(steel_ball_files[0])
+    cpp_defines.append('UVC_AI_HAS_STEEL_BALL_MODEL')
 
 local_arch_flags = ' -mcpu=cortex-m55 -mthumb -mfloat-abi=hard -mfpu=fpv5-d16 -march=armv8.1-m.main+fp.dp+mve'
 opt_flags = ' -Ofast -ffast-math -fno-math-errno -funroll-loops'

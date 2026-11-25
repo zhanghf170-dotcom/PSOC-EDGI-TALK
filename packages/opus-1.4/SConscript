@@ -1,0 +1,44 @@
+from building import *
+Import('rtconfig')
+import os
+
+src   = []
+cwd   = GetCurrentDir()
+group = []
+
+path = []
+path += [cwd]
+path += [cwd + '/include']
+path += [cwd + '/silk', cwd + '/celt', cwd + '/silk/fixed']
+path += [cwd + '/celt/arm', cwd + '/silk/arm', cwd + '/silk/fixed/arm']
+
+# Base definitions
+CPPDEFINES = ['HAVE_LRINTF', 'HAVE_ALLOCA_H', 'USE_ALLOCA', 'OPUS_BUILD', 'FIXED_POINT=1', 'DISABLE_FLOAT_API']
+
+# ARM Cortex-M55 optimizations (ARMv8.1-M with DSP extensions)
+# Enable ARM inline assembly optimizations - M55 supports ARMv5E/ARMv6 DSP instructions
+CPPDEFINES += [
+    'OPUS_ARM_INLINE_ASM',    # Enable ARM inline assembly
+    'OPUS_ARM_INLINE_EDSP',   # Enable ARMv5E DSP instructions (smulwb, smlawb, etc.)
+    'OPUS_ARM_INLINE_MEDIA',  # Enable ARMv6 SIMD instructions (smuad, smlad, etc.)
+]
+
+# Build from source
+print('=== Building libopus from source ===')
+src += Glob('./celt/*.c')
+src += Glob('./silk/*.c')
+src += Glob('./silk/fixed/*.c')
+src += Glob('./src/*.c')
+
+SrcRemove(src, ['./src/opus_demo.c', './src/repacketizer_demo.c', './src/opus_compare.c', './celt/opus_custom_demo.c', './src/opus_test.c'])
+
+if rtconfig.PLATFORM != 'gcc':
+    LOCAL_CCFLAGS = ' -Wno-error -Wno-#warnings -Oz'
+else:
+    LOCAL_CCFLAGS = ' -Wno-unused-variable -Wno-maybe-uninitialized -Wno-sign-compare -Wno-unused-but-set-variable'
+
+group = DefineGroup('libopus', src, depend = [''],
+                    CPPPATH = path, CPPDEFINES = CPPDEFINES,
+                    LOCAL_CCFLAGS = LOCAL_CCFLAGS)
+
+Return('group')

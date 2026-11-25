@@ -211,38 +211,78 @@ static rt_err_t drv_wlan_scan(struct rt_wlan_device *wlan, struct rt_scan_info *
 
 static rt_err_t drv_wlan_join(struct rt_wlan_device *wlan, struct rt_sta_info *sta_info)
 {
-    rt_err_t ret;
+    whd_result_t ret;
+    whd_interface_t itf = get_drv_wifi(wlan)->whd_itf;
     whd_ssid_t whd_ssid = { .length = sta_info->ssid.len };
     whd_security_t security = (whd_security_t)sta_info->security;
-    switch (security)
-    {
-    case WHD_SECURITY_OPEN:
-    case WHD_SECURITY_WPA2_AES_PSK:
-    case WHD_SECURITY_WPA2_AES_PSK_SHA256:
-    case WHD_SECURITY_WPA2_TKIP_PSK:
-    case WHD_SECURITY_WPA2_MIXED_PSK:
-    case WHD_SECURITY_WPA2_WPA_AES_PSK:
-    case WHD_SECURITY_WPA2_WPA_MIXED_PSK:
-    case WHD_SECURITY_WPA3_SAE:
-    case WHD_SECURITY_WPA3_WPA2_PSK:
-        break;
-    default:
-        LOG_W("Unsupported Wi-Fi security: 0x%lx", (unsigned long)security);
-        rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_CONNECT_FAIL, RT_NULL);
-        return -RT_ENOSYS;
-    }
+    rt_bool_t auto_sec = RT_FALSE;
 
     memcpy(whd_ssid.value, sta_info->ssid.val, whd_ssid.length);
 
-    ret = whd_wifi_join(get_drv_wifi(wlan)->whd_itf, &whd_ssid, security,
-                            (const uint8_t *)sta_info->key.val, sta_info->key.len);
+    if (security == WHD_SECURITY_UNKNOWN)
+    {
+        if (sta_info->key.len == 0)
+        {
+            security = WHD_SECURITY_OPEN;
+        }
+        else
+        {
+            security = WHD_SECURITY_WPA2_AES_PSK;
+            auto_sec = RT_TRUE;
+        }
+    }
+    else
+    {
+        switch (security)
+        {
+        case WHD_SECURITY_OPEN:
+        case WHD_SECURITY_WPA2_AES_PSK:
+        case WHD_SECURITY_WPA2_AES_PSK_SHA256:
+        case WHD_SECURITY_WPA2_TKIP_PSK:
+        case WHD_SECURITY_WPA2_MIXED_PSK:
+        case WHD_SECURITY_WPA2_WPA_AES_PSK:
+        case WHD_SECURITY_WPA2_WPA_MIXED_PSK:
+        case WHD_SECURITY_WPA2_FBT_PSK:
+        case WHD_SECURITY_WPA3_SAE:
+        case WHD_SECURITY_WPA3_WPA2_PSK:
+            break;
+        default:
+            LOG_W("Unsupported Wi-Fi security: 0x%lx", (unsigned long)security);
+            rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_CONNECT_FAIL, RT_NULL);
+            return -RT_ENOSYS;
+        }
+    }
+
+    ret = whd_wifi_join(itf, &whd_ssid, security,
+                        (const uint8_t *)sta_info->key.val, sta_info->key.len);
+
+    if (auto_sec && ret != WHD_SUCCESS &&
+        ret != WHD_NETWORK_NOT_FOUND && ret != WHD_INVALID_KEY)
+    {
+        static const whd_security_t fallbacks[] = {
+            WHD_SECURITY_WPA3_WPA2_PSK,
+            WHD_SECURITY_WPA3_SAE,
+            WHD_SECURITY_WPA2_MIXED_PSK,
+        };
+        for (size_t i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++)
+        {
+            ret = whd_wifi_join(itf, &whd_ssid, fallbacks[i],
+                                (const uint8_t *)sta_info->key.val, sta_info->key.len);
+            if (ret == WHD_SUCCESS || ret == WHD_NETWORK_NOT_FOUND)
+            {
+                break;
+            }
+        }
+    }
 
     if (ret != WHD_SUCCESS)
     {
+        LOG_W("whd_wifi_join failed: 0x%lx", (unsigned long)ret);
         rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_CONNECT_FAIL, RT_NULL);
+        return -RT_ERROR;
     }
 
-    return ret;
+    return RT_EOK;
 }
 
 static rt_err_t drv_wlan_softap(struct rt_wlan_device *wlan, struct rt_ap_info *ap_info)

@@ -54,10 +54,10 @@ MEMORY
 {
     m55_data_INTERNAL : ORIGIN = 0x20000000, LENGTH = 0x00040000
     m55_code_INTERNAL : ORIGIN = 0x00000000, LENGTH = 0x00040000
-    m55_nvm : ORIGIN = 0x60580000, LENGTH = 0x00840000
-    m55_trailer : ORIGIN = 0x60DC0000, LENGTH = 0x00040000
-    m55_hyperram : ORIGIN = 0x64200000, LENGTH = 0x00200000
-    m33_m55_shared_hyperram : ORIGIN = 0x64400000, LENGTH = 0x00C00000
+    m55_nvm : ORIGIN = 0x60580000, LENGTH = 0x00A00000
+    m55_trailer : ORIGIN = 0x60F80000, LENGTH = 0x00040000
+    m55_hyperram : ORIGIN = 0x64200000, LENGTH = 0x00400000
+    m33_m55_shared_hyperram : ORIGIN = 0x64600000, LENGTH = 0x00A00000
     m55_code_secondary : ORIGIN = 0x26000000, LENGTH = 0x00060000
     m55_data_secondary : ORIGIN = 0x26060000, LENGTH = 0x00310000
     m33_m55_shared : ORIGIN = 0x26370000, LENGTH = 0x00040000
@@ -76,6 +76,7 @@ REGION_ALIAS("gfx_mem_sel", gfx_mem)
 REGION_ALIAS("m55_allocatable_shared_sel", m55_allocatable_shared)
 REGION_ALIAS("m55_hyperram_sel", m55_hyperram)
 REGION_ALIAS("m33_m55_shared_hyperram_sel", m33_m55_shared_hyperram)
+__m55_hyperram_heap_end__ = ORIGIN(m55_hyperram) + LENGTH(m55_hyperram);
 
 
 /* Linker script to place sections and symbol values. Should be used together
@@ -252,11 +253,6 @@ SECTIONS
         LONG(ADDR(.cy_socmem_data))         /* To run address in SOCMEM  */
         LONG(SIZEOF(.cy_socmem_data)/4)     /* Size in words */
 
-        /* UVC isochronous DMA buffers in non-cacheable shared SoCMEM */
-        LONG(LOADADDR(.cy_uvc_stream_data)) /* From load address in ext flash  */
-        LONG(ADDR(.cy_uvc_stream_data))     /* To run address in shared SoCMEM */
-        LONG(SIZEOF(.cy_uvc_stream_data)/4) /* Size in words */
-
         /* Initialized ML model data in SoCMEM */
         LONG(LOADADDR(.cy_ml_model_data))   /* From load address in ext flash  */
         LONG(ADDR(.cy_ml_model_data))       /* To run address in SoCMEM */
@@ -283,6 +279,15 @@ SECTIONS
 
         LONG(__bss_start__)                       /* Start of the zero-initialized data section */
         LONG((__bss_end__ - __bss_start__)/4)     /* Size of the zero-initialized data section in words */
+
+        LONG(__cy_ml_arena_fast_start__)          /* Zero-initialized ML arena/working buffers in SoCMEM */
+        LONG((__cy_ml_arena_fast_end__ - __cy_ml_arena_fast_start__)/4)
+
+        LONG(__cy_uvc_stream_start__)             /* Zero-initialized CherryUSB UVC DMA buffers in SoCMEM */
+        LONG((__cy_uvc_stream_end__ - __cy_uvc_stream_start__)/4)
+
+        LONG(ADDR(.cy_usb_control_data))
+        LONG(SIZEOF(.cy_usb_control_data)/4)
 
         __zero_table_end__ = .;
     } > m55_nvm_sel
@@ -441,8 +446,10 @@ SECTIONS
     .cy_ml_arena_fast_data (NOLOAD) :
     {
         . = ALIGN(16);
+        __cy_ml_arena_fast_start__ = .;
         KEEP(*(.cy_ml_arena_fast_data))
         . = ALIGN(16);
+        __cy_ml_arena_fast_end__ = .;
     } > m55_data_secondary
 
     .cy_ml_model_data :
@@ -461,6 +468,14 @@ SECTIONS
         . = ALIGN(16);
         KEEP(*(.cy_ml_input_data))
         . = ALIGN(16);
+    } > m55_code_secondary_sel
+
+    /* AI worker stack in remaining D-Cacheable SoCMEM code_secondary window (frees 64KB DTCM + Flash) */
+    .cy_ai_worker_stack (NOLOAD) :
+    {
+        . = ALIGN(8);
+        KEEP(*(.cy_ai_worker_stack))
+        . = ALIGN(8);
     } > m55_code_secondary_sel
 
     .cy_ml_arena_data (NOLOAD) :
@@ -484,13 +499,22 @@ SECTIONS
         . = ALIGN(16);
     } > m33_m55_shared_sel
 
-    /* Keep CherryUSB isochronous DMA buffers in non-cacheable on-chip SRAM. */
-    .cy_uvc_stream_data :
+    /* Keep CherryUSB isochronous DMA buffers in non-cacheable on-chip SRAM (zeroed via .zero.table). */
+    .cy_uvc_stream_data (NOLOAD) :
     {
         . = ALIGN(32);
+        __cy_uvc_stream_start__ = .;
         KEEP(*libusbh_uvc.a:usbh_uvc_stream.o(.cy_socmem_data))
         . = ALIGN(32);
-    } > m33_m55_shared_sel AT > m55_nvm_sel
+        __cy_uvc_stream_end__ = .;
+    } > m33_m55_shared_sel
+
+    .cy_usb_control_data (NOLOAD) :
+    {
+        . = ALIGN(32);
+        KEEP(*(.cy_usb_control_data))
+        . = ALIGN(32);
+    } > m33_m55_shared_sel
 
     /* A section for the heap memory */
     .heap(NOLOAD) :
