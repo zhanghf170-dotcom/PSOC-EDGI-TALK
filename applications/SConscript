@@ -11,31 +11,17 @@ usb_port = ports_root + '/usb'
 path = [
     cwd,
     cwd + '/xiaozhi',
+    cwd + '/third_party',
     usb_port,
     hal_root,
     common_root + '/deepcraft_ai/include',
     cwd + '/../packages/wavplayer-latest/inc',
     cwd + '/../packages/aht10-latest/inc',
 ]
-gallery_assets = [('photos.rgb565', 'gallery_photos'),
-                  ('thumbnails.rgb565', 'gallery_thumbnails')]
-gemini_assets = [
-    ('gemini_idle.jpg', 'gemini_img_idle'),
-    ('gemini_listening.jpg', 'gemini_img_listening'),
-    ('gemini_thinking.jpg', 'gemini_img_thinking'),
-    ('gemini_speaking.jpg', 'gemini_img_speaking'),
-    ('gemini_winking.jpg', 'gemini_img_winking'),
-    ('gemini_surprised.jpg', 'gemini_img_surprised'),
-    ('gemini_sad.jpg', 'gemini_img_sad'),
-    ('gemini_sleepy.jpg', 'gemini_img_sleepy'),
-    ('gemini_avatar_64.rgb565', 'gemini_avatar_64_rgb565'),
-    ('gemini_voices.bin', 'gemini_voices_bin'),
-]
 src = Glob('*.c', exclude=['cockpit_alarm_data.c', 'watch_wallpaper_data.c',
                            'xiaozhi_ding_data.c', 'xiaozhi_zh_ttf_data.c',
-                           'xiaozhi_ding_wav.c', 'xiaozhi_zh_ttf.c', 'optional_media.c']
-           + [name + '.c' for _, name in gallery_assets]
-           + [name + '.c' for _, name in gemini_assets])
+                           'xiaozhi_ding_wav.c', 'xiaozhi_zh_ttf.c', 'optional_media.c',
+                           'gallery_photos.c', 'gallery_thumbnails.c'])
 
 def embed_asset(target, source, env):
     name = env['ASSET_NAME']
@@ -66,18 +52,8 @@ def optional_asset(filename, name, empty_size=0):
     missing_assets.append((name, empty_size))
     return []
 
-src += env.Command('#build/applications/cockpit_alarm_data.c',
-                   '#resources/cockpit_alarm.wav', embed_asset, ASSET_NAME='cockpit_alarm_wav')
-src += optional_asset('xiaozhi_ding.wav', 'xiaozhi_ding_wav')
+# Keep GB2312 Level-1 TTF in Flash when available so Chinese UI stays intact without TF card
 src += optional_asset('xiaozhi_zh_l1.ttf', 'xiaozhi_zh_ttf')
-src += env.Command('#build/applications/watch_wallpaper_data.c',
-                   media_root.File('watch_wallpaper.rgb565'), embed_asset, ASSET_NAME='watch_wallpaper_rgb565')
-for file, name in gallery_assets:
-    src += env.Command('#build/applications/' + name + '.c',
-                       media_root.File('gallery/' + file), embed_asset, ASSET_NAME=name)
-for file, name in gemini_assets:
-    empty_size = 64 * 64 * 2 if name == 'gemini_avatar_64_rgb565' else 0
-    src += optional_asset('gemini/' + file, name, empty_size)
 
 if missing_assets:
     src += env.Command('#build/applications/optional_media.c', File('#applications/SConscript'),

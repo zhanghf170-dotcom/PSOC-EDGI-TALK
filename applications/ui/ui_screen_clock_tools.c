@@ -15,9 +15,13 @@
 #include "ui_manager.h"
 #include "watch_info.h"
 #include "xiaozhi.h"
+#include "sd_assets.h"
+#include "src/widgets/calendar/lv_calendar_chinese_private.h"
 
 #define CT_MAX_LAPS  16U
 #define CT_CELLS     42U
+#define CT_MAX_ANNIVERSARIES 64U
+#define CT_ANNIVERSARY_NAME  64U
 
 static ui_chrome_t g_chrome;
 static int g_active_tab = 0; /* 0=Calendar, 1=Stopwatch, 2=Countdown */
@@ -38,9 +42,56 @@ static lv_obj_t *g_cal_ym_lbl;
 static lv_obj_t *g_cal_today_lbl;
 static lv_obj_t *g_cal_cells[CT_CELLS];
 static lv_obj_t *g_cal_cell_lbls[CT_CELLS];
+static lv_obj_t *g_cal_cell_notes[CT_CELLS];
 static int       g_cal_cell_days[CT_CELLS];
 static lv_obj_t *g_cal_detail_lbl;
 static lv_obj_t *g_cal_sub_lbl;
+static lv_obj_t *g_cal_event_lbl;
+
+typedef struct {
+    uint16_t year; /* Zero repeats every year. */
+    uint8_t month;
+    uint8_t day;
+    char name[CT_ANNIVERSARY_NAME];
+} calendar_anniversary_t;
+
+static calendar_anniversary_t g_anniversaries[CT_MAX_ANNIVERSARIES]
+    __attribute__((section(".cy_socmem_data")));
+static unsigned g_anniversary_count;
+static bool g_cal_sd_mounted;
+static uint32_t g_cal_sd_gen;
+
+typedef struct {
+    uint8_t month;
+    uint8_t day;
+    const char *name;
+} calendar_event_t;
+
+static const calendar_event_t g_solar_events[] = {
+    {1, 1, "元旦"}, {2, 14, "情人节"}, {3, 8, "妇女节"},
+    {3, 12, "植树节"}, {5, 1, "劳动节"}, {5, 4, "青年节"},
+    {6, 1, "儿童节"}, {7, 1, "建党节"}, {8, 1, "建军节"},
+    {9, 3, "抗战胜利纪念日"}, {9, 10, "教师节"}, {9, 30, "烈士纪念日"},
+    {10, 1, "国庆节"}, {12, 13, "南京大屠杀死难者国家公祭日"},
+    {12, 24, "平安夜"}, {12, 25, "圣诞节"},
+};
+
+static const calendar_event_t g_lunar_events[] = {
+    {1, 1, "春节"}, {1, 15, "元宵节"}, {5, 5, "端午节"},
+    {7, 7, "七夕节"}, {8, 15, "中秋节"}, {9, 9, "重阳节"},
+    {12, 8, "腊八节"},
+};
+
+static const char *const g_lunar_months[] = {
+    "正月", "二月", "三月", "四月", "五月", "六月",
+    "七月", "八月", "九月", "十月", "冬月", "腊月",
+};
+
+static const char *const g_lunar_days[] = {
+    "初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
+    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
+    "二十一", "二十二", "二十三", "二十四", "二十五", "二十六", "二十七", "二十八", "二十九", "三十",
+};
 
 /* ---------------- Stopwatch State ---------------- */
 static bool     g_sw_running = false;
@@ -110,6 +161,142 @@ static long civil_to_days(int y, int m, int d)
     unsigned doy = (153U * (unsigned)(m + (m > 2 ? -3 : 9)) + 2U) / 5U + (unsigned)d - 1U;
     unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
     return (long)era * 146097L + (long)doe - 719468L;
+}
+
+static int read_date_digits(const char *str, unsigned count)
+{
+    int n = 0;
+    for (unsigned i = 0; i < count; i++)
+    {
+        if (str[i] < '0' || str[i] > '9') return -1;
+        n = n * 10 + (str[i] - '0');
+    }
+    return n;
+}
+
+static void cal_reload_anniversaries(void)
+{
+    g_cal_sd_gen = sdcard_get_mount_gen();
+    g_cal_sd_mounted = sdcard_is_mounted();
+    g_anniversary_count = 0;
+    if (!g_cal_sd_mounted) return;
+
+    FILE *file = fopen(SD_CALENDAR_PATH, "rb");
+    if (!file) return;
+
+    char line[CT_ANNIVERSARY_NAME + 16];
+    bool first_line = true;
+    while (g_anniversary_count < CT_MAX_ANNIVERSARIES && fgets(line, sizeof(line), file))
+    {
+        char *p = line;
+        if (first_line && strncmp(p, "\xef\xbb\xbf", 3) == 0) p += 3;
+        first_line = false;
+        size_t length = strlen(p);
+        if (!strchr(p, '\n') && !feof(file))
+        {
+            int c;
+            do { c = fgetc(file); } while (c != EOF && c != '\n');
+            continue;
+        }
+        while (length && (p[length - 1] == '\r' || p[length - 1] == '\n' ||
+                          p[length - 1] == ' ' || p[length - 1] == '\t'))
+            p[--length] = '\0';
+
+        char *comma = strchr(p, ',');
+        if (!comma || p[0] == '#') continue;
+        int year = 0;
+        if (comma - p == 10 && p[4] == '-')
+        {
+            year = read_date_digits(p, 4);
+            if (year < 1) continue;
+            p += 5;
+        }
+        if (comma - p != 5 || p[2] != '-') continue;
+        int month = read_date_digits(p, 2);
+        int day = read_date_digits(p + 3, 2);
+        if (month < 1 || month > 12 || day < 1 ||
+            day > days_in_month(year ? year : 2000, month)) continue;
+
+        p = comma + 1;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || strlen(p) >= CT_ANNIVERSARY_NAME) continue;
+
+        calendar_anniversary_t *event = &g_anniversaries[g_anniversary_count++];
+        event->year = (uint16_t)year;
+        event->month = (uint8_t)month;
+        event->day = (uint8_t)day;
+        strcpy(event->name, p);
+    }
+    fclose(file);
+}
+
+static const char *cal_find_event(const calendar_event_t *events, size_t count, int month, int day)
+{
+    for (size_t i = 0; i < count; i++)
+        if (events[i].month == month && events[i].day == day) return events[i].name;
+    return NULL;
+}
+
+static const char *cal_solar_event(int year, int month, int day)
+{
+    /* April dates from the Hong Kong Observatory conversion tables, 2000–2099. */
+    static const char qingming[] =
+        "4555455544" "5544554455" "4455445544" "5544554455" "4445444544"
+        "4544454445" "4445444544" "4544444444" "4444444444" "4444444444";
+    if (month == 4 && year >= 2000 && year < 2000 + (int)sizeof(qingming) - 1 &&
+        day == qingming[year - 2000] - '0')
+        return "清明节";
+    if (month == 5 && day >= 8 && day <= 14 && day_of_week(year, month, day) == 0)
+        return "母亲节";
+    if (month == 6 && day >= 15 && day <= 21 && day_of_week(year, month, day) == 0)
+        return "父亲节";
+    return cal_find_event(g_solar_events, sizeof(g_solar_events) / sizeof(g_solar_events[0]), month, day);
+}
+
+static lv_calendar_chinese_t cal_lunar_date(int year, int month, int day)
+{
+    /* The LVGL converter may read the preceding year's table before Spring Festival. */
+    if (year < 1902 || year > 2099) return (lv_calendar_chinese_t){0};
+    lv_calendar_date_t date = { .year = year, .month = month, .day = day };
+    return lv_calendar_gregorian_to_chinese(&date);
+}
+
+static const char *cal_lunar_event(lv_calendar_chinese_t lunar, int year, int month, int day)
+{
+    if (lunar.leep_month || lunar.today.day == 0) return NULL;
+    if (lunar.today.month == 12 && lunar.today.day >= 29)
+    {
+        if (++day > days_in_month(year, month))
+        {
+            day = 1;
+            if (++month > 12) { month = 1; year++; }
+        }
+        lv_calendar_chinese_t next = cal_lunar_date(year, month, day);
+        if (next.today.month == 1 && next.today.day == 1) return "除夕";
+    }
+    return cal_find_event(g_lunar_events, sizeof(g_lunar_events) / sizeof(g_lunar_events[0]),
+                          lunar.today.month, lunar.today.day);
+}
+
+static bool cal_has_anniversary(int day)
+{
+    for (unsigned i = 0; i < g_anniversary_count; i++)
+    {
+        const calendar_anniversary_t *event = &g_anniversaries[i];
+        if ((event->year == 0 || event->year == g_cal_year) &&
+            event->month == g_cal_month && event->day == day) return true;
+    }
+    return false;
+}
+
+static void cal_append_event(char *text, size_t size, const char *name)
+{
+    if (!name) return;
+    size_t used = strlen(text);
+    const char *separator = used ? " · " : "";
+    if (strlen(separator) + strlen(name) >= size - used) return;
+    strcat(text, separator);
+    strcat(text, name);
 }
 
 static uint32_t tick_to_ms(rt_tick_t ticks)
@@ -187,6 +374,7 @@ static void cal_refresh_view(void)
         {
             g_cal_cell_days[i] = 0;
             ui_set_label_text(g_cal_cell_lbls[i], "");
+            ui_set_label_text(g_cal_cell_notes[i], "");
             lv_obj_set_style_bg_opa(g_cal_cells[i], LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(g_cal_cells[i], 0, 0);
             lv_obj_remove_flag(g_cal_cells[i], LV_OBJ_FLAG_CLICKABLE);
@@ -198,10 +386,32 @@ static void cal_refresh_view(void)
             ui_set_label_text(g_cal_cell_lbls[i], buf);
             lv_obj_add_flag(g_cal_cells[i], LV_OBJ_FLAG_CLICKABLE);
 
+            lv_calendar_chinese_t lunar = cal_lunar_date(g_cal_year, g_cal_month, d);
+            bool anniversary = cal_has_anniversary(d);
+            const char *note = cal_lunar_event(lunar, g_cal_year, g_cal_month, d);
+            if (!note) note = cal_solar_event(g_cal_year, g_cal_month, d);
+            bool holiday = note != NULL;
+            if (anniversary) note = "纪念日";
+            char lunar_month[16];
+            if (!note && lunar.today.day)
+            {
+                if (lunar.today.day == 1)
+                {
+                    snprintf(lunar_month, sizeof(lunar_month), "%s%s", lunar.leep_month ? "闰" : "",
+                             g_lunar_months[lunar.today.month - 1]);
+                    note = lunar_month;
+                }
+                else note = g_lunar_days[lunar.today.day - 1];
+            }
+            ui_set_label_text(g_cal_cell_notes[i], note ? note : "");
+
             bool is_today = (g_cal_year == g_today_year && g_cal_month == g_today_month && d == g_today_day);
             bool is_sel   = (d == g_cal_sel_day);
             int  col      = (int)(i % 7U);
             bool weekend  = (col == 0 || col == 6);
+            lv_obj_set_style_text_color(g_cal_cell_notes[i], is_today ? lv_color_hex(0x102A43)
+                                      : anniversary ? UI_COL_GEMINI_PURPLE
+                                      : holiday ? UI_COL_AMBER : UI_COL_MUTED, 0);
 
             if (is_today)
             {
@@ -237,13 +447,29 @@ static void cal_refresh_view(void)
     long diff = civil_to_days(g_cal_year, g_cal_month, g_cal_sel_day) -
                 civil_to_days(g_today_year, g_today_month, g_today_day);
     int doy = day_of_year(g_cal_year, g_cal_month, g_cal_sel_day);
-    if (diff == 0)
-        snprintf(buf, sizeof(buf), "今年第 %d 天  ·  就是今天", doy);
-    else if (diff > 0)
-        snprintf(buf, sizeof(buf), "今年第 %d 天  ·  距离今天还有 %ld 天", doy, diff);
+    lv_calendar_chinese_t lunar = cal_lunar_date(g_cal_year, g_cal_month, g_cal_sel_day);
+    int offset;
+    if (lunar.today.day)
+        offset = snprintf(buf, sizeof(buf), "农历%s%s%s", lunar.leep_month ? "闰" : "",
+                          g_lunar_months[lunar.today.month - 1], g_lunar_days[lunar.today.day - 1]);
     else
-        snprintf(buf, sizeof(buf), "今年第 %d 天  ·  已过去 %ld 天", doy, -diff);
+        offset = snprintf(buf, sizeof(buf), "本年第 %d 天", doy);
+    if (diff == 0) snprintf(buf + offset, sizeof(buf) - offset, "  ·  今天");
+    else snprintf(buf + offset, sizeof(buf) - offset, "  ·  %ld 天%s",
+                  diff > 0 ? diff : -diff, diff > 0 ? "后" : "前");
     ui_set_label_text(g_cal_sub_lbl, buf);
+
+    char events[256] = "";
+    cal_append_event(events, sizeof(events), cal_solar_event(g_cal_year, g_cal_month, g_cal_sel_day));
+    cal_append_event(events, sizeof(events), cal_lunar_event(lunar, g_cal_year, g_cal_month, g_cal_sel_day));
+    for (unsigned i = 0; i < g_anniversary_count; i++)
+    {
+        const calendar_anniversary_t *event = &g_anniversaries[i];
+        if ((event->year == 0 || event->year == g_cal_year) &&
+            event->month == g_cal_month && event->day == g_cal_sel_day)
+            cal_append_event(events, sizeof(events), event->name);
+    }
+    ui_set_label_text(g_cal_event_lbl, events);
 }
 
 /* ---------------- Stopwatch Refresh ---------------- */
@@ -396,6 +622,12 @@ void ui_screen_clock_tools_open_tab(int tab)
     if (g_panes[0] != NULL)
     {
         apply_tab_ui();
+        if (tab == 0)
+        {
+            cal_reload_anniversaries();
+            refresh_today_from_rtc();
+            cal_refresh_view();
+        }
         ui_screen_clock_tools_update();
     }
 }
@@ -407,18 +639,25 @@ static void tab_btn_cb(lv_event_t *e)
     ui_screen_clock_tools_open_tab((int)(intptr_t)lv_event_get_user_data(e));
 }
 
-static void cal_prev_cb(lv_event_t *e)
+static void cal_move_month(int step)
 {
-    (void)e;
-    if (--g_cal_month < 1) { g_cal_month = 12; g_cal_year--; }
+    int month = (g_cal_year - 1) * 12 + g_cal_month - 1 + step;
+    if (month < 0 || month >= 9999 * 12) return;
+    g_cal_year = month / 12 + 1;
+    g_cal_month = month % 12 + 1;
     cal_refresh_view();
 }
 
-static void cal_next_cb(lv_event_t *e)
+bool ui_screen_clock_tools_handle_swipe(lv_dir_t dir)
 {
-    (void)e;
-    if (++g_cal_month > 12) { g_cal_month = 1; g_cal_year++; }
-    cal_refresh_view();
+    if (g_active_tab != 0 || (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT)) return false;
+    cal_move_month(dir == LV_DIR_LEFT ? 1 : -1);
+    return true;
+}
+
+static void cal_month_cb(lv_event_t *e)
+{
+    cal_move_month((int)(intptr_t)lv_event_get_user_data(e));
 }
 
 static void cal_today_cb(lv_event_t *e)
@@ -587,7 +826,7 @@ static lv_obj_t *build_calendar_pane(lv_obj_t *body)
     lv_obj_add_style(b_prev, &g_st_btn_ghost, 0);
     lv_obj_set_size(b_prev, 68, 40);
     lv_obj_align(b_prev, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_add_event_cb(b_prev, cal_prev_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(b_prev, cal_month_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
     lv_obj_center(ct_label(b_prev, f_small, UI_COL_TEXT, LV_SYMBOL_LEFT));
 
     g_cal_ym_lbl = ct_label(hdr, f_full, UI_COL_CYAN, "2026年 11月");
@@ -608,11 +847,10 @@ static lv_obj_t *build_calendar_pane(lv_obj_t *body)
     lv_obj_add_style(b_next, &g_st_btn_ghost, 0);
     lv_obj_set_size(b_next, 68, 40);
     lv_obj_align(b_next, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_add_event_cb(b_next, cal_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(b_next, cal_month_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
     lv_obj_center(ct_label(b_next, f_small, UI_COL_TEXT, LV_SYMBOL_RIGHT));
 
-    /* 7-Column Calendar Grid Card (460 x 430) */
-    lv_obj_t *gcard = ct_card(pane, 460, 430);
+    lv_obj_t *gcard = ct_card(pane, 460, 416);
     lv_obj_set_style_pad_all(gcard, 10, 0);
     lv_obj_set_flex_flow(gcard, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(gcard, 6, 0);
@@ -620,6 +858,7 @@ static lv_obj_t *build_calendar_pane(lv_obj_t *body)
     lv_obj_t *wrow = lv_obj_create(gcard);
     lv_obj_remove_style_all(wrow);
     lv_obj_set_size(wrow, 436, 30);
+    lv_obj_remove_flag(wrow, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(wrow, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(wrow, 4, 0);
     static const char *const wnames[7] = {"日", "一", "二", "三", "四", "五", "六"};
@@ -633,7 +872,7 @@ static lv_obj_t *build_calendar_pane(lv_obj_t *body)
 
     lv_obj_t *grid = lv_obj_create(gcard);
     lv_obj_remove_style_all(grid);
-    lv_obj_set_size(grid, 436, 368);
+    lv_obj_set_size(grid, 436, 356);
     lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_style_pad_column(grid, 4, 0);
@@ -650,17 +889,25 @@ static lv_obj_t *build_calendar_pane(lv_obj_t *body)
 
         g_cal_cells[i] = cell;
         g_cal_cell_lbls[i] = ct_label(cell, &lv_font_montserrat_20, UI_COL_TEXT, "");
-        lv_obj_center(g_cal_cell_lbls[i]);
+        lv_obj_align(g_cal_cell_lbls[i], LV_ALIGN_TOP_MID, 0, 5);
+        g_cal_cell_notes[i] = ct_label(cell, f_small, UI_COL_MUTED, "");
+        lv_obj_set_width(g_cal_cell_notes[i], 56);
+        lv_obj_set_style_text_align(g_cal_cell_notes[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(g_cal_cell_notes[i], LV_LABEL_LONG_DOT);
+        lv_obj_align(g_cal_cell_notes[i], LV_ALIGN_BOTTOM_MID, 0, -5);
     }
 
-    /* Selected Date Info Footer (460 x 88) */
-    lv_obj_t *dcard = ct_card(pane, 460, 88);
+    lv_obj_t *dcard = ct_card(pane, 460, 104);
     lv_obj_set_style_pad_hor(dcard, 14, 0);
     lv_obj_set_style_pad_ver(dcard, 10, 0);
     g_cal_detail_lbl = ct_label(dcard, f_full, UI_COL_TEXT, "2026年11月25日 星期三");
     lv_obj_align(g_cal_detail_lbl, LV_ALIGN_TOP_LEFT, 0, 2);
-    g_cal_sub_lbl = ct_label(dcard, f_small, UI_COL_CYAN, "今年第 329 天 · 就是今天");
-    lv_obj_align(g_cal_sub_lbl, LV_ALIGN_BOTTOM_LEFT, 0, -2);
+    g_cal_sub_lbl = ct_label(dcard, f_small, UI_COL_MUTED, "");
+    lv_obj_align(g_cal_sub_lbl, LV_ALIGN_TOP_LEFT, 0, 32);
+    g_cal_event_lbl = ct_label(dcard, f_small, UI_COL_AMBER, "");
+    lv_obj_set_width(g_cal_event_lbl, 430);
+    lv_label_set_long_mode(g_cal_event_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(g_cal_event_lbl, LV_ALIGN_TOP_LEFT, 0, 58);
 
     return pane;
 }
@@ -929,8 +1176,17 @@ bool ui_screen_clock_tools_is_running(void)
 void ui_screen_clock_tools_update(void)
 {
     ui_update_chrome(&g_chrome);
+    int prev_year = g_today_year, prev_month = g_today_month, prev_day = g_today_day;
+    bool had_rtc = g_cal_inited_from_rtc;
     refresh_today_from_rtc();
-    if (g_active_tab == 0)      cal_refresh_view();
+    if (g_active_tab == 0)
+    {
+        bool sd_changed = g_cal_sd_mounted != !!sdcard_is_mounted() || g_cal_sd_gen != sdcard_get_mount_gen();
+        if (sd_changed) cal_reload_anniversaries();
+        if (sd_changed || had_rtc != g_cal_inited_from_rtc ||
+            prev_year != g_today_year || prev_month != g_today_month || prev_day != g_today_day)
+            cal_refresh_view();
+    }
     else if (g_active_tab == 1) sw_refresh_view();
     else                        cd_refresh_view();
 }

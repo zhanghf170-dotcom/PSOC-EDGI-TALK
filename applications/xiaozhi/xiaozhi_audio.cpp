@@ -7,13 +7,17 @@
 
 #include <rtthread.h>
 #include <rtdevice.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 extern "C" {
 #include <wavplayer.h>
 #include "opus.h"
 #include "xiaozhi.h"
 #include "alert_manager.h"
+#include "sd_assets.h"
+#include "music_player.h"
 }
 
 #define DBG_TAG "xz.audio"
@@ -51,11 +55,7 @@ extern "C" {
 #define MIC_EVENT_CLOSE         (1U << 1)
 
 #define GEMV_MAGIC              0x564D4547UL
-
-extern "C" {
-extern const unsigned char gemini_voices_bin[];
-extern const size_t gemini_voices_bin_size;
-}
+#define GEMV_MAX_CLIP_BYTES     (64U * 1024U)
 
 typedef struct
 {
@@ -184,11 +184,10 @@ static rt_err_t speaker_hw_open_locked(xz_audio_ctx_t *ctx)
         }
     }
 
-    /* Stop any ongoing wavplayer clip before opening sound0 for TTS */
+    /* Stop any ongoing wavplayer clip before opening sound0 for TTS (music already preempted before lock) */
     if (wavplayer_state_get() != PLAYER_STATE_STOPED)
     {
         wavplayer_stop();
-        rt_thread_mdelay(40);
     }
 
     rt_err_t ret = rt_device_open(ctx->rt_audio_dev, RT_DEVICE_OFLAG_WRONLY);
@@ -237,6 +236,7 @@ int xz_audio_stream_begin(void)
     g_aud->pending_voice_clip = -1;
     g_aud->ext_stream_abort   = RT_FALSE;
 
+    music_player_preempt();
     xiaozhi_audio_lock();
     rt_err_t ret = speaker_hw_open_locked(g_aud);
     if (ret == RT_EOK)
@@ -318,42 +318,79 @@ rt_bool_t xz_audio_is_local_voice_playing(void)
 
 static void play_embedded_opus_clip(xz_audio_ctx_t *ctx, int clip_idx)
 {
-    if (ctx == RT_NULL || ctx->decoder == RT_NULL || clip_idx < 0)
-        return;
-    if (gemini_voices_bin_size < 16U)
+    if (ctx == RT_NULL || ctx->decoder == RT_NULL || clip_idx < 0 || !sdcard_is_mounted())
         return;
 
-    uint32_t magic = 0U, count = 0U;
-    rt_memcpy(&magic, gemini_voices_bin, 4U);
-    rt_memcpy(&count, gemini_voices_bin + 4U, 4U);
+    FILE *fp = fopen(SD_GEMINI_VOICES_PATH, "rb");
+    if (fp == NULL)
+    {
+        LOG_W("gemini voice pack not found on TF card: %s", SD_GEMINI_VOICES_PATH);
+        return;
+    }
+
+    uint32_t hdr[2] = {0U, 0U};
+    if (fread(hdr, 4U, 2U, fp) != 2U)
+    {
+        fclose(fp);
+        return;
+    }
+    uint32_t magic = hdr[0], count = hdr[1];
     if (magic != GEMV_MAGIC || (uint32_t)clip_idx >= count)
     {
         LOG_W("invalid voice pack (magic=0x%08lx count=%lu idx=%d)",
               (unsigned long)magic, (unsigned long)count, clip_idx);
+        fclose(fp);
         return;
     }
 
-    uint32_t entry_off = 8U + (uint32_t)clip_idx * 8U;
-    if (entry_off + 8U > gemini_voices_bin_size) return;
+    long entry_off = (long)(8U + (uint32_t)clip_idx * 8U);
+    uint32_t entry[2] = {0U, 0U};
+    if (fseek(fp, entry_off, SEEK_SET) != 0 || fread(entry, 4U, 2U, fp) != 2U)
+    {
+        fclose(fp);
+        return;
+    }
 
-    uint32_t blob_off = 0U, blob_sz = 0U;
-    rt_memcpy(&blob_off, gemini_voices_bin + entry_off, 4U);
-    rt_memcpy(&blob_sz,  gemini_voices_bin + entry_off + 4U, 4U);
-    if (blob_off + blob_sz > gemini_voices_bin_size) return;
+    uint32_t blob_off = entry[0], blob_sz = entry[1];
+    if (blob_sz == 0U || blob_sz > GEMV_MAX_CLIP_BYTES)
+    {
+        LOG_W("invalid voice clip #%d size=%lu", clip_idx, (unsigned long)blob_sz);
+        fclose(fp);
+        return;
+    }
 
-    const uint8_t *p   = gemini_voices_bin + blob_off;
-    const uint8_t *end = p + blob_sz;
+    uint8_t *blob = (uint8_t *)rt_malloc(blob_sz);
+    if (blob == RT_NULL)
+    {
+        fclose(fp);
+        return;
+    }
+    if (fseek(fp, (long)blob_off, SEEK_SET) != 0 || fread(blob, 1U, blob_sz, fp) != blob_sz)
+    {
+        rt_free(blob);
+        fclose(fp);
+        return;
+    }
+    fclose(fp);
+
+    const uint8_t *p   = blob;
+    const uint8_t *end = blob + blob_sz;
 
     /* Reset Opus decoder state cleanly and open sound0 under audio arbiter lock */
+    music_player_preempt();
     xiaozhi_audio_lock();
     opus_decoder_ctl(ctx->decoder, OPUS_RESET_STATE);
     rt_err_t open_ret = speaker_hw_open_locked(ctx);
     xiaozhi_audio_unlock();
-    if (open_ret != RT_EOK) return;
+    if (open_ret != RT_EOK)
+    {
+        rt_free(blob);
+        return;
+    }
 
     ctx->local_voice_playing = RT_TRUE;
     ctx->local_voice_abort   = RT_FALSE;
-    LOG_I("Gemini-chan speaking local TTS clip #%d (%lu B)", clip_idx, (unsigned long)blob_sz);
+    LOG_I("Gemini-chan speaking TF TTS clip #%d (%lu B)", clip_idx, (unsigned long)blob_sz);
 
     while ((p + 2U) <= end && !ctx->local_voice_abort && !ctx->is_tx_enable && !ctx->ext_stream_active)
     {
@@ -382,6 +419,7 @@ static void play_embedded_opus_clip(xz_audio_ctx_t *ctx, int clip_idx)
         xiaozhi_audio_unlock();
     }
 
+    rt_free(blob);
     ctx->local_voice_playing = RT_FALSE;
     ctx->spk_level = 0U;
 
@@ -401,13 +439,15 @@ static void play_embedded_opus_clip(xz_audio_ctx_t *ctx, int clip_idx)
 void xz_play_wake_sound(void)
 {
     xz_audio_stop_local_voice();
+    music_player_preempt();
     xiaozhi_audio_lock();
     if (g_aud != RT_NULL && g_aud->sound_opened)
     {
         speaker_hw_close_locked(g_aud);
     }
     wavplayer_volume_set(alert_get_volume());
-    if (wavplayer_play((char *)"/xiaozhi_ding.wav") == RT_EOK)
+    if (sdcard_is_mounted() && access(SD_DING_WAV_PATH, 0) == 0 &&
+        wavplayer_play((char *)SD_DING_WAV_PATH) == RT_EOK)
     {
         /* Let the short wake chime finish before opening mic0 so mic won't capture it */
         for (int i = 0; i < 45; i++)
@@ -430,6 +470,7 @@ void xz_mic(int on)
     if (on)
     {
         xz_audio_stop_local_voice();
+        music_player_preempt();
         if (!g_aud->is_rx_enable)
         {
             rt_ringbuffer_reset(g_aud->rb_mic_pcm);
@@ -474,6 +515,7 @@ void xz_speaker(int on)
     {
         g_aud->local_voice_abort = RT_TRUE;
         g_aud->pending_voice_clip = -1;
+        music_player_preempt();
         xiaozhi_audio_lock();
         if (speaker_hw_open_locked(g_aud) == RT_EOK)
         {

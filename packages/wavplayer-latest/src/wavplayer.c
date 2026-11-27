@@ -58,6 +58,7 @@ struct wavplayer
     rt_mq_t mq;
     rt_mutex_t lock;
     struct rt_completion ack;
+    volatile rt_bool_t stop_pending_ack;
     FILE *fp;
     int volume;
 };
@@ -181,14 +182,15 @@ int wavplayer_resume(void)
 int wavplayer_volume_set(int volume)
 {
     struct rt_audio_caps caps;
+    rt_device_t dev;
 
     if (volume < VOLUME_MIN)
         volume = VOLUME_MIN;
     else if (volume > VOLUME_MAX)
         volume = VOLUME_MAX;
 
-    player.device = rt_device_find(PKG_WP_PLAY_DEVICE);
-    if (player.device == RT_NULL)
+    dev = rt_device_find(PKG_WP_PLAY_DEVICE);
+    if (dev == RT_NULL)
         return -RT_ERROR;
 
     player.volume = volume;
@@ -197,7 +199,7 @@ int wavplayer_volume_set(int volume)
     caps.udata.value = volume;
 
     LOG_D("set volume = %d", volume);
-    return rt_device_control(player.device, AUDIO_CTL_CONFIGURE, &caps);
+    return rt_device_control(dev, AUDIO_CTL_CONFIGURE, &caps);
 }
 
 int wavplayer_volume_get(void)
@@ -218,12 +220,15 @@ char *wavplayer_uri_get(void)
 static rt_err_t wavplayer_open(struct wavplayer *player)
 {
     rt_err_t result = RT_EOK;
+    rt_device_t dev = RT_NULL;
     struct rt_audio_caps caps;
     struct wav_header wav;
 
+    player->device = RT_NULL;
+
     /* find device */
-    player->device = rt_device_find(PKG_WP_PLAY_DEVICE);
-    if (player->device == RT_NULL)
+    dev = rt_device_find(PKG_WP_PLAY_DEVICE);
+    if (dev == RT_NULL)
     {
         LOG_E("device %s not find", PKG_WP_PLAY_DEVICE);
         return - RT_ERROR;
@@ -239,12 +244,13 @@ static rt_err_t wavplayer_open(struct wavplayer *player)
     }
 
     /* open sound device */
-    result = rt_device_open(player->device, RT_DEVICE_OFLAG_WRONLY);
+    result = rt_device_open(dev, RT_DEVICE_OFLAG_WRONLY);
     if (result != RT_EOK)
     {
         LOG_E("open %s device faield", PKG_WP_PLAY_DEVICE);
         goto __exit;
     }
+    player->device = dev;
 
     LOG_D("open wavplayer, device %s", PKG_WP_PLAY_DEVICE);
     /* read wavfile header information from file */
@@ -337,7 +343,7 @@ static int wavplayer_event_handler(struct wavplayer *player, int timeout)
 
     case MSG_STOP:
         event = PLAYER_EVENT_STOP;
-        player->state = PLAYER_STATE_STOPED;
+        player->stop_pending_ack = RT_TRUE;
         break;
 
     case MSG_PAUSE:
@@ -355,7 +361,10 @@ static int wavplayer_event_handler(struct wavplayer *player, int timeout)
         break;
     }
 
-    rt_completion_done(&player->ack);
+    if (msg.type != MSG_STOP)
+    {
+        rt_completion_done(&player->ack);
+    }
 
 #if (DBG_LEVEL >= DBG_LOG)
     LOG_D("EVENT:%s, STATE:%s -> %s", event_str[event], state_str[last_state], state_str[player->state]);
@@ -390,7 +399,14 @@ static void wavplayer_entry(void *parameter)
         /* wait play event forever */
         event = wavplayer_event_handler(&player, RT_WAITING_FOREVER);
         if (event != PLAYER_EVENT_PLAY)
+        {
+            if (player.stop_pending_ack)
+            {
+                player.stop_pending_ack = RT_FALSE;
+                rt_completion_done(&player.ack);
+            }
             continue;
+        }
 
         /* open wavplayer */
         result = wavplayer_open(&player);
@@ -402,6 +418,7 @@ static void wavplayer_entry(void *parameter)
         }
 
         LOG_I("play start, uri=%s", player.uri);
+        rt_bool_t finished = RT_FALSE;
         while (1)
         {
             event = wavplayer_event_handler(&player, RT_WAITING_NO);
@@ -415,7 +432,7 @@ static void wavplayer_entry(void *parameter)
                 if (size != 1)
                 {
                     /* FILE END*/
-                    player.state = PLAYER_STATE_STOPED;
+                    finished = RT_TRUE;
                 }
                 else
                 {
@@ -429,18 +446,25 @@ static void wavplayer_entry(void *parameter)
             {
                 /* wait resume or stop event forever */
                 event = wavplayer_event_handler(&player, RT_WAITING_FOREVER);
+                break;
             }
 
             default:
                 break;
             }
 
-            if (player.state == PLAYER_STATE_STOPED)
+            if (finished || event == PLAYER_EVENT_STOP)
                 break;
         }
 
-        /* close wavplayer */
+        /* close wavplayer before marking stopped and acknowledging MSG_STOP */
         wavplayer_close(&player);
+        player.state = PLAYER_STATE_STOPED;
+        if (player.stop_pending_ack)
+        {
+            player.stop_pending_ack = RT_FALSE;
+            rt_completion_done(&player.ack);
+        }
         LOG_I("play end");
     }
 

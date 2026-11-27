@@ -24,6 +24,7 @@ static lv_obj_t *g_ta_pwd;
 static lv_obj_t *g_kb;
 static char g_selected_ssid[33];
 static rt_bool_t g_was_scanning = RT_FALSE;
+static uint32_t g_last_scan_seq = 0U;
 
 static void wifi_scan_btn_cb(lv_event_t *e)
 {
@@ -125,8 +126,7 @@ static void ap_item_click_cb(lv_event_t *e)
 {
     const char *ssid = (const char *)lv_event_get_user_data(e);
     if (ssid == NULL) return;
-    rt_strncpy(g_selected_ssid, ssid, sizeof(g_selected_ssid) - 1U);
-    g_selected_ssid[sizeof(g_selected_ssid) - 1U] = '\0';
+    wifi_ssid_copy_utf8(g_selected_ssid, sizeof(g_selected_ssid), ssid);
     lv_label_set_text_fmt(g_modal_ssid_lbl, "连接 %s", g_selected_ssid);
     lv_obj_add_flag(g_ta_ssid, LV_OBJ_FLAG_HIDDEN);
     lv_textarea_set_text(g_ta_pwd, "");
@@ -138,6 +138,8 @@ static void wifi_rebuild_ap_list(void)
 {
     static wifi_ap_item_t items[WIFI_MGR_MAX_SCAN_APS];
     static char ssid_store[WIFI_MGR_MAX_SCAN_APS][33];
+    const lv_font_t *f_full  = ui_font_zh_full();
+    const lv_font_t *f_small = ui_font_zh_small();
     rt_bool_t scanning = RT_FALSE;
     int cnt = wifi_mgr_get_scan_results(items, WIFI_MGR_MAX_SCAN_APS, &scanning);
 
@@ -148,27 +150,28 @@ static void wifi_rebuild_ap_list(void)
         lv_obj_t *empty = lv_label_create(g_ap_list);
         lv_label_set_text(empty, scanning ? "正在搜索附近网络" : "点击扫描，选择和电脑同一路由器的网络");
         lv_obj_set_width(empty, lv_pct(100));
-        lv_obj_set_style_text_font(empty, UI_FONT_ZH, 0);
+        lv_obj_set_style_text_font(empty, f_small, 0);
         lv_obj_set_style_text_color(empty, UI_COL_MUTED, 0);
         return;
     }
 
     for (int i = 0; i < cnt; i++)
     {
-        rt_strncpy(ssid_store[i], items[i].ssid, 32U);
-        ssid_store[i][32] = '\0';
+        wifi_ssid_copy_utf8(ssid_store[i], sizeof(ssid_store[i]), items[i].ssid);
 
         lv_obj_t *row = lv_button_create(g_ap_list);
         lv_obj_add_style(row, &g_st_btn_ghost, 0);
         lv_obj_set_size(row, 416, 44);
         lv_obj_set_style_pad_hor(row, 12, 0);
+        lv_obj_set_style_pad_ver(row, 4, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_add_event_cb(row, ap_item_click_cb, LV_EVENT_CLICKED, ssid_store[i]);
 
         lv_obj_t *sl = lv_label_create(row);
         lv_label_set_text(sl, ssid_store[i]);
-        lv_obj_set_style_text_font(sl, UI_FONT_ZH, 0);
+        lv_obj_set_style_text_font(sl, f_full, 0);
         lv_obj_set_style_text_color(sl, UI_COL_TEXT, 0);
         lv_obj_set_flex_grow(sl, 1);
         lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
@@ -182,6 +185,9 @@ static void wifi_rebuild_ap_list(void)
 
 lv_obj_t *ui_screen_wifi_create(void)
 {
+    const lv_font_t *f_full  = ui_font_zh_full();
+    const lv_font_t *f_small = ui_font_zh_small();
+
     lv_obj_t *scr = lv_obj_create(NULL);
     ui_create_chrome(scr, "无线网络与图传", UI_SCR_WIFI, &g_chrome);
 
@@ -199,7 +205,9 @@ lv_obj_t *ui_screen_wifi_create(void)
     lv_obj_set_style_pad_row(scard, 6, 0);
 
     g_lbl_conn_state = lv_label_create(scard);
-    lv_obj_set_style_text_font(g_lbl_conn_state, UI_FONT_ZH, LV_PART_MAIN);
+    lv_obj_set_width(g_lbl_conn_state, 430);
+    lv_label_set_long_mode(g_lbl_conn_state, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(g_lbl_conn_state, f_full, LV_PART_MAIN);
     lv_label_set_text(g_lbl_conn_state, "无线模块初始化中");
     lv_obj_set_style_text_color(g_lbl_conn_state, UI_COL_CYAN, 0);
 
@@ -321,35 +329,41 @@ lv_obj_t *ui_screen_wifi_create(void)
 
     lv_obj_t *ap_title = lv_label_create(sbar);
     lv_label_set_text(ap_title, "附近网络");
-    lv_obj_set_style_text_font(ap_title, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(ap_title, f_full, 0);
     lv_obj_set_style_text_color(ap_title, UI_COL_TEXT, 0);
     lv_obj_set_flex_grow(ap_title, 1);
 
     g_btn_scan = lv_button_create(sbar);
     lv_obj_add_style(g_btn_scan, &g_st_btn_primary, 0);
     lv_obj_set_size(g_btn_scan, 108, 34);
+    lv_obj_set_style_pad_hor(g_btn_scan, 6, 0);
+    lv_obj_set_style_pad_ver(g_btn_scan, 0, 0);
     lv_obj_add_event_cb(g_btn_scan, wifi_scan_btn_cb, LV_EVENT_CLICKED, NULL);
     g_lbl_scan_btn = lv_label_create(g_btn_scan);
     lv_label_set_text(g_lbl_scan_btn, "扫描");
-    lv_obj_set_style_text_font(g_lbl_scan_btn, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(g_lbl_scan_btn, f_small, 0);
     lv_obj_center(g_lbl_scan_btn);
 
     g_btn_manual = lv_button_create(sbar);
     lv_obj_add_style(g_btn_manual, &g_st_btn_ghost, 0);
     lv_obj_set_size(g_btn_manual, 96, 34);
+    lv_obj_set_style_pad_hor(g_btn_manual, 6, 0);
+    lv_obj_set_style_pad_ver(g_btn_manual, 0, 0);
     lv_obj_add_event_cb(g_btn_manual, wifi_manual_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *manual_label = lv_label_create(g_btn_manual);
     lv_label_set_text(manual_label, "手动");
-    lv_obj_set_style_text_font(manual_label, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(manual_label, f_small, 0);
     lv_obj_center(manual_label);
 
     lv_obj_t *bdisc = lv_button_create(sbar);
     lv_obj_add_style(bdisc, &g_st_btn_danger, 0);
     lv_obj_set_size(bdisc, 74, 34);
+    lv_obj_set_style_pad_hor(bdisc, 6, 0);
+    lv_obj_set_style_pad_ver(bdisc, 0, 0);
     lv_obj_add_event_cb(bdisc, wifi_disc_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *ldisc = lv_label_create(bdisc);
     lv_label_set_text(ldisc, "断开");
-    lv_obj_set_style_text_font(ldisc, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(ldisc, f_small, 0);
     lv_obj_center(ldisc);
 
     g_ap_list = lv_obj_create(scancard);
@@ -374,7 +388,7 @@ lv_obj_t *ui_screen_wifi_create(void)
 
     lv_obj_t *dlg = lv_obj_create(g_modal_pwd);
     lv_obj_add_style(dlg, &g_st_card, 0);
-    lv_obj_set_size(dlg, 436, 220);
+    lv_obj_set_size(dlg, 436, LV_SIZE_CONTENT);
     lv_obj_align(dlg, LV_ALIGN_TOP_MID, 0, 96);
     lv_obj_remove_flag(dlg, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(dlg, LV_FLEX_FLOW_COLUMN);
@@ -384,25 +398,27 @@ lv_obj_t *ui_screen_wifi_create(void)
     lv_label_set_text(g_modal_ssid_lbl, "连接 Wi-Fi");
     lv_obj_set_width(g_modal_ssid_lbl, 408);
     lv_label_set_long_mode(g_modal_ssid_lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(g_modal_ssid_lbl, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(g_modal_ssid_lbl, f_full, 0);
     lv_obj_set_style_text_color(g_modal_ssid_lbl, UI_COL_CYAN, 0);
 
     g_ta_ssid = lv_textarea_create(dlg);
     lv_obj_set_size(g_ta_ssid, 408, 42);
+    lv_obj_set_style_pad_ver(g_ta_ssid, 6, 0);
     lv_textarea_set_one_line(g_ta_ssid, true);
     lv_textarea_set_max_length(g_ta_ssid, 32);
     lv_textarea_set_placeholder_text(g_ta_ssid, "网络名称");
-    lv_obj_set_style_text_font(g_ta_ssid, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(g_ta_ssid, f_full, 0);
     lv_obj_add_event_cb(g_ta_ssid, wifi_edit_field, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(g_ta_ssid, LV_OBJ_FLAG_HIDDEN);
 
     g_ta_pwd = lv_textarea_create(dlg);
     lv_obj_set_size(g_ta_pwd, 408, 48);
+    lv_obj_set_style_pad_ver(g_ta_pwd, 8, 0);
     lv_textarea_set_one_line(g_ta_pwd, true);
     lv_textarea_set_password_mode(g_ta_pwd, true);
     lv_textarea_set_max_length(g_ta_pwd, RT_WLAN_PASSWORD_MAX_LENGTH);
     lv_textarea_set_placeholder_text(g_ta_pwd, "Wi-Fi 密码");
-    lv_obj_set_style_text_font(g_ta_pwd, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(g_ta_pwd, f_full, 0);
     lv_obj_add_event_cb(g_ta_pwd, wifi_edit_field, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *mbtns = lv_obj_create(dlg);
@@ -417,20 +433,22 @@ lv_obj_t *ui_screen_wifi_create(void)
     lv_obj_add_style(mcanc, &g_st_btn_ghost, 0);
     lv_obj_set_flex_grow(mcanc, 1);
     lv_obj_set_height(mcanc, 42);
+    lv_obj_set_style_pad_ver(mcanc, 4, 0);
     lv_obj_add_event_cb(mcanc, modal_close_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lcanc = lv_label_create(mcanc);
     lv_label_set_text(lcanc, "取消");
-    lv_obj_set_style_text_font(lcanc, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(lcanc, f_full, 0);
     lv_obj_center(lcanc);
 
     lv_obj_t *mconn = lv_button_create(mbtns);
     lv_obj_add_style(mconn, &g_st_btn_primary, 0);
     lv_obj_set_flex_grow(mconn, 1);
     lv_obj_set_height(mconn, 42);
+    lv_obj_set_style_pad_ver(mconn, 4, 0);
     lv_obj_add_event_cb(mconn, modal_connect_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lconn = lv_label_create(mconn);
     lv_label_set_text(lconn, "连接");
-    lv_obj_set_style_text_font(lconn, UI_FONT_ZH, 0);
+    lv_obj_set_style_text_font(lconn, f_full, 0);
     lv_obj_center(lconn);
 
     g_kb = lv_keyboard_create(g_modal_pwd);
@@ -451,10 +469,12 @@ void ui_screen_wifi_update(void)
 
     if (wst.whd_ready)
     {
+        char conn_buf[128];
         lv_obj_remove_state(g_btn_scan, LV_STATE_DISABLED);
         lv_obj_remove_state(g_btn_manual, LV_STATE_DISABLED);
-        lv_label_set_text_fmt(g_lbl_conn_state, "%s  |  %s (%d dBm)",
-                              wst.status_msg, wst.ssid[0] ? wst.ssid : "--", wst.rssi);
+        rt_snprintf(conn_buf, sizeof(conn_buf), "%s  |  %s (%d dBm)",
+                    wst.status_msg, wst.ssid[0] ? wst.ssid : "--", wst.rssi);
+        ui_set_label_text(g_lbl_conn_state, conn_buf);
     }
     else
     {
@@ -475,9 +495,10 @@ void ui_screen_wifi_update(void)
 
     ui_set_label_text(g_lbl_scan_btn, wst.scanning ? "扫描中" : "扫描");
 
-    if ((g_was_scanning && !wst.scanning) || (!g_was_scanning && wst.scanning))
+    if ((g_was_scanning != wst.scanning) || (g_last_scan_seq != wst.scan_seq))
     {
         g_was_scanning = wst.scanning;
+        g_last_scan_seq = wst.scan_seq;
         wifi_rebuild_ap_list();
     }
 }

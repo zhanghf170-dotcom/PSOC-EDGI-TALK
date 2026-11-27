@@ -18,6 +18,7 @@
 
 #include "usbh_core.h"
 #include "alert_manager.h"
+#include "music_player.h"
 #include "dualcore_bridge.h"
 #include "wifi_stream.h"
 #include "watch_info.h"
@@ -110,6 +111,7 @@ int main(void)
 
     usbh_initialize(0, USBHS_BASE, NULL);
     alert_manager_init();
+    music_player_init();
     dualcore_bridge_init();
     wifi_stream_init();
     watch_info_init();

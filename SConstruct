@@ -67,9 +67,6 @@ Export('SDK_LIB')
 
 # prepare building environment
 objs = PrepareBuilding(env, RTT_ROOT, has_libcpu=False)
-if rtconfig.PLATFORM == 'gcc' and GetDepend(['RT_CHERRYUSB_HOST_VIDEO']):
-    env['LINKFLAGS'] += ' -Wl,--wrap=usbh_video_transfer_abort_callback,--wrap=usbh_submit_urb'
-
 IFX_library = 'Packages'
 rtconfig.BSP_LIBRARY_TYPE = IFX_library
 

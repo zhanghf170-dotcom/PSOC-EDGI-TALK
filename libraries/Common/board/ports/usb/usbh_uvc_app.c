@@ -28,9 +28,10 @@ static int uvc_ai_app_start(uint16_t src_width, uint16_t src_height)
     return 0;
 }
 
-static void uvc_ai_app_process_frame(const struct usbh_videoframe *frame)
+static void uvc_ai_app_process_frame(const struct usbh_videoframe *frame, rt_tick_t tick)
 {
     (void)frame;
+    (void)tick;
 }
 
 static int uvc_ai_app_stop(void)
@@ -48,17 +49,20 @@ void uvc_display_frame(struct usbh_videoframe *frame, uint16_t src_w, uint16_t s
 
 #ifdef BSP_USING_DEEPCRAFT_AI
 #define UVC_FRAME_BYTES (320U * 240U * 2U)
+#define UVC_FRAME_COUNT 3U
+#define UVC_FRAME_SECTION ".cy_ml_arena_fast_data"
 #else
 #define UVC_FRAME_BYTES (640U * 480U * 2U)
-#endif
 #define UVC_FRAME_COUNT 4U
+#define UVC_FRAME_SECTION ".m33_m55_shared_hyperram"
+#endif
 #define UVC_FIRST_FRAME_MS 4500
-#define UVC_NO_FRAME_MS 2200
-#define UVC_STOP_MS 2000
-#define UVC_ISO_RETRY_LIMIT 3U
-#define UVC_REOPEN_QUIET_MS 450
+#define UVC_NO_FRAME_MS 650
+#define UVC_STOP_MS 3500
+#define UVC_REOPEN_QUIET_MS 150
 #define UVC_REOPEN_MAX_SHIFT 2U
 #define UVC_FAILURES_BEFORE_REPROBE 3U
+#define UVC_HEALTHY_STREAM_MS 15000
 
 enum uvc_mode
 {
@@ -86,7 +90,7 @@ struct uvc_request
 };
 
 static USB_MEM_ALIGNX uint8_t frame_buffer[UVC_FRAME_COUNT][UVC_FRAME_BYTES]
-    __attribute__((section(".m33_m55_shared_hyperram")));
+    __attribute__((section(UVC_FRAME_SECTION)));
 static struct usbh_videoframe frame_pool[UVC_FRAME_COUNT];
 static rt_bool_t pool_created;
 
@@ -110,96 +114,10 @@ static volatile uint32_t frames_received;
 static volatile uint32_t frames_dropped;
 static volatile uint32_t display_fps;
 static volatile uint32_t transport_starts;
-static volatile uint32_t suppressed_urb_callbacks;
-static volatile uint32_t recovered_urb_errors;
-
+static volatile uint32_t camera_interval;
+static volatile uint32_t camera_fps;
 static uint16_t capture_width;
 static uint16_t capture_height;
-extern volatile uint32_t g_uvc_fps;
-
-#ifdef UVC_GUARD_USB_CALLBACKS
-static const struct usbh_hubport *uvc_stream_port;
-static const struct usb_endpoint_descriptor *volatile uvc_stream_endpoint;
-static struct uvc_urb_callback
-{
-    struct usbh_urb *urb;
-    usbh_complete_callback_t complete;
-    void *arg;
-    unsigned int retries;
-} uvc_callbacks[2];
-
-int __real_usbh_submit_urb(struct usbh_urb *urb);
-
-static void uvc_complete_urb(void *arg, int nbytes)
-{
-    struct uvc_urb_callback *callback = arg;
-
-    /* During stop the library cancels and frees the two URBs in sequence.
-     * Suppress both callbacks before one of them could requeue its peer. */
-    if (capture_run && camera_attached && uvc_stream_endpoint)
-    {
-        /* An isochronous transaction can fail while the device is still attached.
-         * Requeue the URB without publishing its partial video data. */
-        if (nbytes == -USB_ERR_IO &&
-            (callback->urb->ep->bmAttributes & USB_ENDPOINT_TYPE_MASK) == USB_ENDPOINT_TYPE_ISOCHRONOUS &&
-            callback->retries < UVC_ISO_RETRY_LIMIT)
-        {
-            callback->retries++;
-            if (__real_usbh_submit_urb(callback->urb) == 0)
-            {
-                recovered_urb_errors++;
-                return;
-            }
-        }
-        if (nbytes == 0)
-            callback->retries = 0;
-        callback->complete(callback->arg, nbytes);
-        return;
-    }
-    suppressed_urb_callbacks++;
-}
-
-int __wrap_usbh_submit_urb(struct usbh_urb *urb)
-{
-    rt_base_t level = rt_hw_interrupt_disable();
-    if (!urb || !uvc_stream_endpoint || urb->hport != uvc_stream_port ||
-        urb->ep != uvc_stream_endpoint || !urb->complete)
-    {
-        rt_hw_interrupt_enable(level);
-        return __real_usbh_submit_urb(urb);
-    }
-    if (!capture_run || !camera_attached)
-    {
-        rt_hw_interrupt_enable(level);
-        return -USB_ERR_SHUTDOWN;
-    }
-    if (urb->complete != uvc_complete_urb)
-    {
-        struct uvc_urb_callback *slot = RT_NULL;
-        for (unsigned int i = 0; i < ARRAY_SIZE(uvc_callbacks); ++i)
-        {
-            if (!uvc_callbacks[i].urb || uvc_callbacks[i].urb == urb)
-            {
-                slot = &uvc_callbacks[i];
-                break;
-            }
-        }
-        if (!slot)
-        {
-            rt_hw_interrupt_enable(level);
-            return -USB_ERR_NOMEM;
-        }
-        slot->urb = urb;
-        slot->complete = urb->complete;
-        slot->arg = urb->arg;
-        slot->retries = 0;
-        urb->arg = slot;
-        urb->complete = uvc_complete_urb;
-    }
-    rt_hw_interrupt_enable(level);
-    return __real_usbh_submit_urb(urb);
-}
-#endif
 
 static struct uvc_request uvc_read_request(void)
 {
@@ -235,9 +153,7 @@ void usbh_video_stop(struct usbh_video *video_class)
     rt_base_t level = rt_hw_interrupt_disable();
     camera_attached = RT_FALSE;
     camera_port = RT_NULL;
-#ifdef UVC_GUARD_USB_CALLBACKS
-    uvc_stream_endpoint = RT_NULL;
-#endif
+    usbh_video_stream_cancel();
     if (requested.mode != UVC_MODE_OFF)
     {
         camera_error = -USB_ERR_NODEV;
@@ -251,24 +167,15 @@ void usbh_video_stop(struct usbh_video *video_class)
 
 void usbh_video_stream_open_result(const struct usbh_video *video_class, int result)
 {
-#ifdef UVC_GUARD_USB_CALLBACKS
-    rt_base_t level = rt_hw_interrupt_disable();
-    if (result >= 0 && camera_attached && video_class)
-    {
-        uvc_stream_port = video_class->hport;
-        uvc_stream_endpoint = video_class->is_bulk ? video_class->bulkin : video_class->isoin;
-    }
-    rt_hw_interrupt_enable(level);
-#else
-    (void)video_class;
-#endif
+    if (result >= 0 && video_class)
+        camera_interval = video_class->commit.dwFrameInterval;
     open_result = result;
     if (control_ready)
         rt_sem_release(&control_wake);
 }
 
 /* Keep transport restarts in the same task that owns start and stop. */
-void __wrap_usbh_video_transfer_abort_callback(void)
+void usbh_video_transfer_abort_callback(void)
 {
     if (capture_run)
     {
@@ -318,8 +225,7 @@ static void uvc_frame_thread_entry(void *arg)
         {
             if (monitoring && capture_mode != UVC_MODE_MONITOR)
             {
-                if (uvc_ai_app_stop() != RT_EOK)
-                    continue;
+                uvc_ai_app_stop();
                 monitoring = RT_FALSE;
             }
 
@@ -337,8 +243,8 @@ static void uvc_frame_thread_entry(void *arg)
                 (frame->frame_format != USBH_VIDEO_FORMAT_UNCOMPRESSED ||
                  frame->frame_size >= (uint32_t)w * h * 2U))
             {
-                uvc_display_frame(frame, w, h);
-                frame_tick = rt_tick_get();
+                rt_tick_t input_tick = rt_tick_get();
+                frame_tick = input_tick;
                 frames_received++;
                 if (frames_received == 1U)
                 {
@@ -350,8 +256,9 @@ static void uvc_frame_thread_entry(void *arg)
                     if (!monitoring)
                         monitoring = uvc_ai_app_start(w, h) == RT_EOK;
                     if (monitoring)
-                        uvc_ai_app_process_frame(frame);
+                        uvc_ai_app_process_frame(frame, input_tick);
                 }
+                uvc_display_frame(frame, w, h);
                 if (capture_run && capture_mode != UVC_MODE_OFF)
                 {
                     wifi_stream_submit_frame(frame->frame_buf, frame->frame_size, w, h, frame->frame_format);
@@ -361,10 +268,7 @@ static void uvc_frame_thread_entry(void *arg)
         }
 
         if (monitoring)
-        {
-            while (uvc_ai_app_stop() != RT_EOK)
-                rt_thread_mdelay(25);
-        }
+            uvc_ai_app_stop();
         uvc_display_release_scratch();
         wifi_stream_camera_stopped();
         capture_idle = RT_TRUE;
@@ -398,6 +302,8 @@ static int uvc_start_transport(const struct uvc_request *req)
     frames_received = 0;
     frames_dropped = 0;
     display_fps = 0;
+    camera_fps = 0;
+    camera_interval = 0;
     open_result = RT_EOK;
     camera_error = RT_EOK;
     capture_idle = RT_FALSE;
@@ -411,6 +317,18 @@ static int uvc_start_transport(const struct uvc_request *req)
     return RT_EOK;
 }
 
+static rt_bool_t uvc_video_thread_gone(void)
+{
+    rt_thread_t tid;
+    rt_bool_t gone;
+
+    rt_enter_critical();
+    tid = rt_thread_find("usbh_video");
+    gone = (tid == RT_NULL) || ((tid->stat & RT_THREAD_STAT_MASK) == RT_THREAD_CLOSE);
+    rt_exit_critical();
+    return gone;
+}
+
 static void uvc_control_thread_entry(void *arg)
 {
     (void)arg;
@@ -421,7 +339,8 @@ static void uvc_control_thread_entry(void *arg)
     rt_bool_t reprobe_pending = RT_FALSE;
     rt_bool_t settling = RT_FALSE;
     uint32_t retry_id = 0;
-    uint32_t previous_frames = 0;
+    uint32_t stopping_req_id = 0;
+    uint32_t previous_frames = 0, previous_camera_frames = 0;
     rt_tick_t sample_tick = 0, start_tick = 0, stop_tick = 0, closed_tick = 0;
 
     for (;;)
@@ -468,36 +387,43 @@ static void uvc_control_thread_entry(void *arg)
             active = req;
             transport_started = RT_TRUE;
             start_tick = sample_tick = now;
-            previous_frames = 0;
+            previous_frames = previous_camera_frames = 0;
             continue;
         }
 
         if (!capture_run)
         {
-            if (capture_idle && rt_thread_find("usbh_video") == RT_NULL)
+            if (capture_idle && uvc_video_thread_gone())
             {
                 usbh_video_stream_stop();
-#ifdef UVC_GUARD_USB_CALLBACKS
-                rt_base_t level = rt_hw_interrupt_disable();
-                uvc_stream_endpoint = RT_NULL;
-                uvc_stream_port = RT_NULL;
-                rt_memset(uvc_callbacks, 0, sizeof(uvc_callbacks));
-                rt_hw_interrupt_enable(level);
-#endif
                 transport_started = RT_FALSE;
                 closed_tick = rt_tick_get();
                 settling = RT_TRUE;
-                if (reprobe_pending && req.mode != UVC_MODE_OFF &&
-                    usbh_hub_reprobe_root_port(camera_port) == 0)
-                    USB_LOG_WRN("USB camera port reset requested\r\n");
+                if (reprobe_pending && req.mode != UVC_MODE_OFF)
+                {
+                    rt_base_t port_lvl = rt_hw_interrupt_disable();
+                    struct usbh_hubport *port = camera_attached ? camera_port : RT_NULL;
+                    rt_hw_interrupt_enable(port_lvl);
+                    if (port != RT_NULL && usbh_hub_reprobe_root_port(port) == 0)
+                        USB_LOG_WRN("USB camera port reset requested\r\n");
+                }
                 reprobe_pending = RT_FALSE;
                 display_fps = 0;
                 USB_LOG_INFO("UVC stopped\r\n");
             }
+            else if (camera_state == UVC_FAILED && req.mode != UVC_MODE_OFF && req.id != stopping_req_id)
+            {
+                stopping_req_id = req.id;
+                stop_tick = now;
+                camera_state = UVC_STOPPING;
+            }
             else if (camera_state == UVC_STOPPING && uvc_elapsed(now, stop_tick, UVC_STOP_MS))
             {
-                uvc_fail_request(req.id, -RT_ETIMEOUT);
-                camera_error = -RT_ETIMEOUT;
+                if (req.id == stopping_req_id)
+                {
+                    uvc_fail_request(req.id, -RT_ETIMEOUT);
+                    camera_error = -RT_ETIMEOUT;
+                }
                 camera_state = UVC_FAILED;
                 USB_LOG_ERR("UVC shutdown timed out; waiting for worker ownership to return\r\n");
             }
@@ -541,7 +467,9 @@ static void uvc_control_thread_entry(void *arg)
                 }
             }
             capture_run = RT_FALSE;
+            usbh_video_stream_cancel();
             camera_state = UVC_STOPPING;
+            stopping_req_id = req.id;
             stop_tick = now;
             continue;
         }
@@ -550,7 +478,7 @@ static void uvc_control_thread_entry(void *arg)
         if (frames_received != 0U)
         {
             camera_state = UVC_STREAMING;
-            if (uvc_elapsed(now, start_tick, 8000))
+            if (uvc_elapsed(now, start_tick, UVC_HEALTHY_STREAM_MS) && frames_received >= 5U)
             {
                 retry_shift = 0;
                 consecutive_failures = 0;
@@ -562,6 +490,9 @@ static void uvc_control_thread_entry(void *arg)
             uint32_t count = frames_received;
             display_fps = (count - previous_frames) * RT_TICK_PER_SECOND / elapsed;
             previous_frames = count;
+            count = video_frame_count;
+            camera_fps = (count - previous_camera_frames) * RT_TICK_PER_SECOND / elapsed;
+            previous_camera_frames = count;
             sample_tick = now;
         }
     }
@@ -572,9 +503,9 @@ static int uvc_control_init(void)
     rt_sem_init(&control_wake, "cam_ctl", 0, RT_IPC_FLAG_PRIO);
     rt_sem_init(&frame_wake, "cam_frm", 0, RT_IPC_FLAG_PRIO);
     rt_thread_init(&control_thread, "uvc_ctl", uvc_control_thread_entry, RT_NULL,
-                   control_stack, sizeof(control_stack), 19, 10);
+                   control_stack, sizeof(control_stack), 17, 10);
     rt_thread_init(&frame_thread, "uvc_frm", uvc_frame_thread_entry, RT_NULL,
-                   frame_stack, sizeof(frame_stack), 22, 10);
+                   frame_stack, sizeof(frame_stack), 16, 10);
     control_ready = RT_TRUE;
     rt_thread_startup(&frame_thread);
     rt_thread_startup(&control_thread);
@@ -673,7 +604,7 @@ uint32_t uvc_app_frame_count(void)
 void uvc_app_get_fps(uint32_t *cam_fps, uint32_t *disp_fps, uint32_t *drop_cnt)
 {
     rt_bool_t frame = uvc_app_has_frame();
-    if (cam_fps) *cam_fps = frame ? g_uvc_fps : 0U;
+    if (cam_fps) *cam_fps = frame ? camera_fps : 0U;
     if (disp_fps) *disp_fps = frame ? display_fps : 0U;
     if (drop_cnt) *drop_cnt = frames_dropped;
 }
@@ -682,12 +613,13 @@ static int cmd_uvc_status(void)
 {
     uint32_t cam_fps, disp_fps;
     uvc_app_get_fps(&cam_fps, &disp_fps, RT_NULL);
-    rt_kprintf("UVC state=%s attached=%d mode=%u error=%d frames=%lu cam_fps=%lu disp_fps=%lu dropped=%lu urb=%lu pool=%u starts=%lu suppressed=%lu recovered=%lu\n",
+    rt_kprintf("UVC state=%s attached=%d mode=%u error=%d frames=%lu cam_fps=%lu disp_fps=%lu dropped=%lu urb=%lu pool=%u starts=%lu suppressed=%lu recovered=%lu interval=%lu bad_pkt=%lu bad_frame=%lu\n",
                uvc_app_camera_state(), camera_attached, (unsigned)uvc_read_request().mode, camera_error,
                (unsigned long)frames_received, (unsigned long)cam_fps, (unsigned long)disp_fps,
                (unsigned long)frames_dropped, (unsigned long)video_complete_count,
-               (unsigned)pool_created, (unsigned long)transport_starts, (unsigned long)suppressed_urb_callbacks,
-               (unsigned long)recovered_urb_errors);
+               (unsigned)pool_created, (unsigned long)transport_starts, (unsigned long)video_suppressed_urb_count,
+               (unsigned long)video_recovered_urb_count, (unsigned long)camera_interval,
+               (unsigned long)video_bad_packet_count, (unsigned long)video_dropped_frame_count);
     return 0;
 }
 MSH_CMD_EXPORT_ALIAS(cmd_uvc_status, uvc_status, Show camera lifecycle and frame counters);

@@ -20,6 +20,12 @@
 #define BSP_SOFT_I2C2_SDA_PIN 106
 #endif
 
+#if defined(__has_include)
+#if __has_include("rtconfig_local.h")
+#include "rtconfig_local.h"
+#endif
+#endif
+
 #ifndef WIFI_DEFAULT_SSID
 #define WIFI_DEFAULT_SSID ""
 #endif

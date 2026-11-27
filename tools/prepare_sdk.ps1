@@ -45,29 +45,16 @@ foreach ($Resource in @('55500A1.clm_blob', '55500A1.trxcse', 'cyw55513modpse84s
 if ($ModelRoot) {
     $Destination = Join-Path $RepoRoot 'libraries/Common/deepcraft_ai/model'
     $ModelFiles = @('model.c', 'model.h')
-    $SteelBallFiles = @('steel_ball_model.c', 'steel_ball_model.h')
-    $SteelBallPresent = @($SteelBallFiles | Where-Object {
-        Test-Path -LiteralPath (Join-Path $ModelRoot $_) -PathType Leaf
-    })
-    if ($SteelBallPresent.Count -ne 0) {
-        if ($SteelBallPresent.Count -ne $SteelBallFiles.Count) {
-            throw 'Provide both steel_ball_model.c and steel_ball_model.h.'
-        }
-        $EyeModel = Join-Path $ModelRoot 'model.c'
-        if (!(Test-Path -LiteralPath $EyeModel -PathType Leaf) -or
-            !(Select-String -LiteralPath $EyeModel -Pattern 'ml_shared_get_arena' -Quiet) -or
-            !(Select-String -LiteralPath $EyeModel -Pattern 'ml_shared_get_scratch' -Quiet)) {
-            throw 'The steel-ball model requires the eye-state adapter with the shared arena and scratch buffer.'
-        }
-        $ModelFiles += $SteelBallFiles
-    }
     foreach ($File in $ModelFiles) {
         if (!(Test-Path -LiteralPath (Join-Path $ModelRoot $File) -PathType Leaf)) {
             throw "The model directory must contain $File."
         }
     }
+    if (Test-Path -LiteralPath (Join-Path $ModelRoot 'steel_ball_model.h') -PathType Leaf) {
+        $ModelFiles += 'steel_ball_model.h'
+    }
     foreach ($File in $ModelFiles) {
-        Copy-Item -LiteralPath (Join-Path $ModelRoot $File) -Destination $Destination
+        Copy-Item -LiteralPath (Join-Path $ModelRoot $File) -Destination $Destination -Force
     }
 }
 

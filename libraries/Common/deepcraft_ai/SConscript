@@ -74,13 +74,8 @@ cpp_defines = [
     'CY_ML_WORKING_MEM=.cy_ml_arena_fast_data',
 ]
 
-steel_ball_files = ['model/steel_ball_model.c', 'model/steel_ball_model.h']
-if all(os.path.isfile(os.path.join(cwd, name)) for name in steel_ball_files):
-    src.append(steel_ball_files[0])
-    cpp_defines.append('UVC_AI_HAS_STEEL_BALL_MODEL')
-
 local_arch_flags = ' -mcpu=cortex-m55 -mthumb -mfloat-abi=hard -mfpu=fpv5-d16 -march=armv8.1-m.main+fp.dp+mve'
-opt_flags = ' -Ofast -ffast-math -fno-math-errno -funroll-loops'
+opt_flags = ' -O3 -fno-math-errno -funroll-loops'
 
 group = DefineGroup(
     'DeepcraftAi',

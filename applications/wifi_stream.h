@@ -2,6 +2,7 @@
 #define WIFI_STREAM_H__
 
 #include <rtthread.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -44,6 +45,7 @@ typedef struct
     uint32_t  tx_kbps;
     uint32_t  frames_encoded;
     uint32_t  relay_sent_count;
+    uint32_t  scan_seq;
 } wifi_status_t;
 
 int  wifi_stream_init(void);
@@ -62,6 +64,7 @@ int  wifi_stream_get_quality(void);
 void wifi_stream_set_max_fps(int fps);
 int  wifi_stream_get_max_fps(void);
 
+void wifi_ssid_copy_utf8(char *dst, size_t dst_sz, const char *src);
 int  wifi_mgr_start_scan(void);
 int  wifi_mgr_get_scan_results(wifi_ap_item_t *out, int max_items, rt_bool_t *scanning);
 int  wifi_mgr_connect(const char *ssid, const char *pwd, rt_bool_t save_cfg);

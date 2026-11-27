@@ -37,7 +37,7 @@ extern "C" {
 
 #define XZ_DEFAULT_HOST         "api.tenclass.net"
 #define XZ_DEFAULT_WSPATH       "/xiaozhi/v1/"
-#define XZ_DEFAULT_TOKEN        ""
+#define XZ_DEFAULT_TOKEN        "Bearer 12345678"
 #define XZ_CFG_PATH             "/sdcard/xiaozhi.cfg"
 #define XZ_TTS_BRIDGE_PORT      8890U
 #define XZ_TTS_QUEUE_MAX        8
@@ -1443,7 +1443,7 @@ int xiaozhi_init(void)
                                               RT_TIMER_FLAG_ONE_SHOT);
 
     g_xz->multi_turn = RT_TRUE;
-    g_xz->voice_mode = XZ_VOICE_MODE_XIAOYI; /* Default to cute XiaoyiNeural female voice! */
+    g_xz->voice_mode = XZ_VOICE_MODE_CLOUD; /* Default to XiaoZhi cloud native TTS audio */
     g_xz->tts_port   = XZ_TTS_BRIDGE_PORT;
     g_xz->state      = XZ_STATE_OFFLINE;
     g_xz->emotion    = XZ_EMO_IDLE;
@@ -1538,7 +1538,7 @@ void xiaozhi_set_voice_mode(xz_voice_mode_t mode)
 
 xz_voice_mode_t xiaozhi_get_voice_mode(void)
 {
-    return (g_xz != RT_NULL) ? g_xz->voice_mode : XZ_VOICE_MODE_XIAOYI;
+    return (g_xz != RT_NULL) ? g_xz->voice_mode : XZ_VOICE_MODE_CLOUD;
 }
 
 void xiaozhi_set_tts_host(const char *ip)

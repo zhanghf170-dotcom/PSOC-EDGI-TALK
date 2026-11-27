@@ -15,6 +15,7 @@ struct usbh_video_resolution {
     uint16_t wWidth;
     uint16_t wHeight;
     uint32_t dwDefaultFrameInterval;
+    uint32_t dwMonitorFrameInterval;
 };
 
 struct usbh_video_format {
@@ -59,6 +60,7 @@ struct usbh_video {
     struct usbh_video_format format[3];
 
     void *user_data;
+    uint8_t ae_priority_terminal;
 };
 
 #ifdef __cplusplus

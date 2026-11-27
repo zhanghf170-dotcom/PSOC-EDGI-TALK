@@ -35,7 +35,8 @@
 
 /* SD Host timing parameters */
 #define CY_SDIO_MIN_FREQ_HZ         (400000U)       /* 400KHz for identification */
-#define CY_SDIO_MAX_FREQ_HZ         (50000000U)     /* 50MHz high speed */
+#define CY_SDIO_MAX_FREQ_HZ         (50000000U)     /* 50MHz high speed (SDIO0 Wi-Fi) */
+#define CY_SDIO1_MAX_FREQ_HZ        (25000000U)     /* 25MHz default speed (SDIO1 TF card via TXS02612) */
 
 /* DMA and buffer configuration */
 #define CY_SDIO_ADMA_MAX_LEN        (0xFFFFU)       /* ADMA max length 64KB */
@@ -56,6 +57,9 @@ struct cy_pse_sdio_hw_desc
     mtb_hal_sdhc_t *sdhc_obj;           /* SDHC hardware objects */
     const cy_stc_sd_host_init_config_t *pdl_config;  /* SDHC PDL config */
     const mtb_hal_sdhc_configurator_t *hal_config; /* SDHC HAL configurator */
+    cy_en_sd_host_io_voltage_t default_io_volt;    /* Default IO voltage (1.8V SDIO0 / 3.3V SDIO1) */
+    rt_uint32_t max_freq_hz;                       /* Max clock frequency */
+    rt_bool_t is_sdcard;                           /* RT_TRUE for removable TF card slot */
 };
 
 /**
@@ -69,6 +73,8 @@ struct cy_pse_sdio
     volatile rt_bool_t cmd53_pending;
     rt_uint32_t cmd53_completed;
     rt_uint32_t cmd53_timeouts;
+    volatile rt_uint32_t err_streak;    /* Consecutive SD card command/data error count */
+    volatile rt_uint32_t total_errors;  /* Total SD card command/data error count */
     rt_uint8_t *bounce_buf;             /* DMA bounce buffer */
     rt_size_t bounce_size;              /* Bounce buffer size */
     rt_uint8_t power_mode;              /* Current power mode */
@@ -348,6 +354,14 @@ static rt_err_t cy_sdio_send_command(struct cy_pse_sdio *sdio, struct rt_mmcsd_c
         goto exit_hw;
     }
 
+    /* Bail out immediately if hardware already flagged an error (e.g. CMD_TOUT_ERR)
+     * so we don't busy-wait 500ms in mtb_hal_sdhc_wait_transfer_complete(). */
+    if (mtb_hal_sdhc_get_last_command_errors(sdio->hw_desc->sdhc_obj) != MTB_HAL_SDHC_NO_ERR)
+    {
+        err = -RT_ERROR;
+        goto exit_hw;
+    }
+
     /* Get response if expected */
     if ((err == RT_EOK) && (hal_cmd.response_type != MTB_HAL_SDHC_RESPONSE_NONE))
     {
@@ -454,6 +468,19 @@ exit_hw:
             mtb_hal_sdhc_software_reset(sdio->hw_desc->sdhc_obj);
     }
 
+    if (sdio->hw_desc->is_sdcard && sdio->host != RT_NULL && sdio->host->card != RT_NULL)
+    {
+        if (err != RT_EOK)
+        {
+            sdio->err_streak++;
+            sdio->total_errors++;
+        }
+        else
+        {
+            sdio->err_streak = 0;
+        }
+    }
+
 exit:
     cmd->err = err;
     if (data)
@@ -525,6 +552,11 @@ static void cy_sdio_set_iocfg(struct rt_mmcsd_host *host, struct rt_mmcsd_io_cfg
 
     CY_SDIO_LOCK(sdio);
 
+    cy_en_sd_host_io_voltage_t io_volt =
+        (io_cfg->signal_voltage == MMCSD_SIGNAL_VOLTAGE_330)
+            ? CY_SD_HOST_IO_VOLT_3_3V
+            : CY_SD_HOST_IO_VOLT_1_8V;
+
     /* Handle power mode changes */
     if (io_cfg->power_mode == MMCSD_POWER_OFF)
     {
@@ -538,58 +570,53 @@ static void cy_sdio_set_iocfg(struct rt_mmcsd_host *host, struct rt_mmcsd_io_cfg
     }
     else if (io_cfg->power_mode == MMCSD_POWER_UP)
     {
-        if (sdio->power_mode == MMCSD_POWER_OFF)
+        /*
+         * Always perform a clean reset & 400KHz power-up sequence on POWER_UP
+         * (including re-probes after card removal/recovery):
+         * 1. Disable SD clock & power off briefly, reset command/data lines
+         * 2. Set requested IO voltage (3.3V for TF card, 1.8V for Wi-Fi SDIO)
+         * 3. Set bus width to 1-bit & clock to 400KHz (identification frequency)
+         * 4. Enable card power, ramp-up delay, then enable SD clock
+         */
+        Cy_SD_Host_DisableSdClk(sdio->hw_desc->hw_base);
+        mtb_hal_sdhc_enable_card_power(sdio->hw_desc->sdhc_obj, false);
+        mtb_hal_sdhc_clear_errors(sdio->hw_desc->sdhc_obj);
+        mtb_hal_sdhc_software_reset(sdio->hw_desc->sdhc_obj);
+        rt_thread_mdelay(10);
+
+        Cy_SD_Host_ChangeIoVoltage(sdio->hw_desc->hw_base, io_volt);
+        (void)Cy_SD_Host_SetHostBusWidth(sdio->hw_desc->hw_base, CY_SD_HOST_BUS_WIDTH_1_BIT);
+
+        /* Set identification clock frequency - negotiate=false since card not ready */
+        result = mtb_hal_sdhc_set_frequency(sdio->hw_desc->sdhc_obj, CY_SDIO_MIN_FREQ_HZ, false);
+        if (result != CY_RSLT_SUCCESS)
         {
-            /*
-             * Power-up sequence per SD specification:
-             * 1. Set IO voltage to 1.8V
-             * 2. Set bus width to 1-bit
-             * 3. Set clock to 400KHz (identification frequency)
-             * 4. Enable card power
-             * 5. Wait for voltage ramp-up (at least 35ms per SD spec)
-             * 6. Enable SD clock
-             */
-            Cy_SD_Host_ChangeIoVoltage(sdio->hw_desc->hw_base, CY_SD_HOST_IO_VOLT_1_8V);
-            (void)Cy_SD_Host_SetHostBusWidth(sdio->hw_desc->hw_base, CY_SD_HOST_BUS_WIDTH_1_BIT);
-
-            /* Set identification clock frequency - negotiate=false since card not ready */
-            result = mtb_hal_sdhc_set_frequency(sdio->hw_desc->sdhc_obj, CY_SDIO_MIN_FREQ_HZ, false);
-            if (result != CY_RSLT_SUCCESS)
-            {
-                LOG_W("Set init freq fail: 0x%08x", (unsigned int)result);
-            }
-            sdio->current_freq = CY_SDIO_MIN_FREQ_HZ;
-
-            /* Enable card power */
-            mtb_hal_sdhc_enable_card_power(sdio->hw_desc->sdhc_obj, true);
-
-            /* Wait for power supply ramp-up time (SD spec requires 35ms minimum) */
-            rt_thread_mdelay(50);
-
-            /* Enable SD clock output */
-            Cy_SD_Host_EnableSdClk(sdio->hw_desc->hw_base);
-
-            /* Additional stabilization delay */
-            rt_thread_mdelay(10);
-
-            sdio->power_mode = MMCSD_POWER_UP;
-            sdio->bus_width = 1;
-            LOG_D("Card power UP, clock 400KHz");
+            LOG_W("Set init freq fail: 0x%08x", (unsigned int)result);
         }
+        sdio->current_freq = CY_SDIO_MIN_FREQ_HZ;
+
+        /* Enable card power */
+        mtb_hal_sdhc_enable_card_power(sdio->hw_desc->sdhc_obj, true);
+
+        /* Wait for power supply ramp-up time (SD spec requires 35ms minimum) */
+        rt_thread_mdelay(50);
+
+        /* Enable SD clock output */
+        Cy_SD_Host_EnableSdClk(sdio->hw_desc->hw_base);
+
+        /* Additional stabilization delay */
+        rt_thread_mdelay(10);
+
+        sdio->power_mode = MMCSD_POWER_UP;
+        sdio->bus_width = 1;
+        LOG_D("Card power UP, clock 400KHz");
     }
     else if (io_cfg->power_mode == MMCSD_POWER_ON)
     {
         if (sdio->power_mode == MMCSD_POWER_OFF)
         {
             /* Full power-up sequence needed */
-            if (io_cfg->signal_voltage == MMCSD_SIGNAL_VOLTAGE_330)
-            {
-                Cy_SD_Host_ChangeIoVoltage(sdio->hw_desc->hw_base, CY_SD_HOST_IO_VOLT_3_3V);
-            }
-            else
-            {
-                Cy_SD_Host_ChangeIoVoltage(sdio->hw_desc->hw_base, CY_SD_HOST_IO_VOLT_1_8V);
-            }
+            Cy_SD_Host_ChangeIoVoltage(sdio->hw_desc->hw_base, io_volt);
             (void)Cy_SD_Host_SetHostBusWidth(sdio->hw_desc->hw_base, CY_SD_HOST_BUS_WIDTH_1_BIT);
             result = mtb_hal_sdhc_set_frequency(sdio->hw_desc->sdhc_obj, CY_SDIO_MIN_FREQ_HZ, false);
             if (result != CY_RSLT_SUCCESS)
@@ -607,8 +634,8 @@ static void cy_sdio_set_iocfg(struct rt_mmcsd_host *host, struct rt_mmcsd_io_cfg
         LOG_D("Card power ON");
     }
 
-    /* Only configure clock and bus width when power is on */
-    if (sdio->power_mode != MMCSD_POWER_OFF)
+    /* Only configure clock and bus width when power is ON */
+    if (sdio->power_mode == MMCSD_POWER_ON)
     {
         /* Configure clock frequency */
         if (clock == 0)
@@ -625,7 +652,8 @@ static void cy_sdio_set_iocfg(struct rt_mmcsd_host *host, struct rt_mmcsd_io_cfg
         }
         if (clock != sdio->current_freq)
         {
-            result = mtb_hal_sdhc_set_frequency(sdio->hw_desc->sdhc_obj, clock, true);
+            /* RT-Thread mmcsd core already negotiates card speed via CMD6/CMD52 */
+            result = mtb_hal_sdhc_set_frequency(sdio->hw_desc->sdhc_obj, clock, false);
             if (result != CY_RSLT_SUCCESS)
             {
                 LOG_E("set freq %uHz fail 0x%08x", (unsigned int)clock, (unsigned int)result);
@@ -710,13 +738,80 @@ static const struct rt_mmcsd_host_ops cy_sdio_ops =
 };
 
 /**
- * @brief Card detection stub - always returns true for now
+ * @brief Card detection via SDHC1 card-detect GPIO (active-low on TF-01A)
  */
 bool Cy_SD_Host_IsCardConnected(SDHC_Type const *base)
 {
+#if defined(BSP_USING_SDIO1) && defined(CYBSP_SDHC_DETECT_PORT) && defined(CYBSP_SDHC_DETECT_PIN)
+    if (base == CYBSP_SDHC_1_HW)
+    {
+        return (Cy_GPIO_Read(CYBSP_SDHC_DETECT_PORT, CYBSP_SDHC_DETECT_PIN) == 0U);
+    }
+#endif
     (void)base;
     return true;
 }
+
+#ifdef BSP_USING_SDIO1
+rt_bool_t sdio1_is_card_present(void)
+{
+    return (sdio1 != RT_NULL && Cy_SD_Host_IsCardConnected(CYBSP_SDHC_1_HW)) ? RT_TRUE : RT_FALSE;
+}
+
+rt_uint32_t sdio1_get_err_streak(void)
+{
+    return (sdio1 != RT_NULL) ? sdio1->err_streak : 0U;
+}
+
+rt_uint32_t sdio1_get_total_errors(void)
+{
+    return (sdio1 != RT_NULL) ? sdio1->total_errors : 0U;
+}
+
+rt_uint32_t sdio1_get_clock(void)
+{
+    return (sdio1 != RT_NULL) ? sdio1->current_freq : 0U;
+}
+
+void sdio1_trigger_redetect(rt_bool_t probe_after_remove)
+{
+    if (sdio1 == RT_NULL || sdio1->host == RT_NULL)
+    {
+        return;
+    }
+
+    if (sdio1->host->card != RT_NULL)
+    {
+        mmcsd_change(sdio1->host);
+        for (int wait = 0; wait < 100 && sdio1->host->card != RT_NULL; wait++)
+        {
+            rt_thread_mdelay(20);
+        }
+    }
+
+    sdio1->err_streak = 0U;
+
+    CY_SDIO_LOCK(sdio1);
+    Cy_SD_Host_DisableSdClk(sdio1->hw_desc->hw_base);
+    mtb_hal_sdhc_enable_card_power(sdio1->hw_desc->sdhc_obj, false);
+    mtb_hal_sdhc_clear_errors(sdio1->hw_desc->sdhc_obj);
+    mtb_hal_sdhc_software_reset(sdio1->hw_desc->sdhc_obj);
+    sdio1->power_mode = MMCSD_POWER_OFF;
+    sdio1->bus_width = 1;
+    sdio1->current_freq = CY_SDIO_MIN_FREQ_HZ;
+    CY_SDIO_UNLOCK(sdio1);
+
+    if (probe_after_remove && sdio1_is_card_present())
+    {
+        rt_thread_mdelay(80);
+        mmcsd_change(sdio1->host);
+        for (int wait = 0; wait < 100 && sdio1->host->card == RT_NULL; wait++)
+        {
+            rt_thread_mdelay(25);
+        }
+    }
+}
+#endif /* BSP_USING_SDIO1 */
 
 static void cy_sdio_irq_handler(struct cy_pse_sdio *sdio)
 {
@@ -836,13 +931,13 @@ struct cy_pse_sdio *sdio_host_create(const struct cy_pse_sdio_hw_desc *hw_desc)
 
     /*
      * Pre-initialize SD host hardware according to SD specification:
-     * 1. Set IO voltage to 1.8V
+     * 1. Set IO voltage (1.8V for SDIO0 Wi-Fi, 3.3V for SDIO1 TF card)
      * 2. Set bus width to 1-bit (required for identification phase)
      * 3. Set clock to 400KHz (identification frequency)
      * 4. Enable card interrupts
      * Note: Use negotiate=false since card is not initialized yet
      */
-    Cy_SD_Host_ChangeIoVoltage(hw_desc->hw_base, CY_SD_HOST_IO_VOLT_1_8V);
+    Cy_SD_Host_ChangeIoVoltage(hw_desc->hw_base, hw_desc->default_io_volt);
     (void)Cy_SD_Host_SetHostBusWidth(hw_desc->hw_base, CY_SD_HOST_BUS_WIDTH_1_BIT);
     Cy_SD_Host_SetNormalInterruptMask(sdio->hw_desc->hw_base, CY_SD_HOST_CARD_INTERRUPT);
 
@@ -858,7 +953,7 @@ struct cy_pse_sdio *sdio_host_create(const struct cy_pse_sdio_hw_desc *hw_desc)
     /* Configure MMCSD host */
     sdio->host->ops = &cy_sdio_ops;
     sdio->host->freq_min = CY_SDIO_MIN_FREQ_HZ;
-    sdio->host->freq_max = CY_SDIO_MAX_FREQ_HZ;
+    sdio->host->freq_max = hw_desc->max_freq_hz;
 
     /* Supported voltage range: 2.7V - 3.6V */
     sdio->host->valid_ocr = VDD_27_28 | VDD_28_29 | VDD_29_30 | VDD_30_31 |
@@ -913,6 +1008,9 @@ int rt_hw_sdio_init(void)
         .sdhc_obj = &sdhc0_obj,
         .pdl_config = &CYBSP_SDHC_0_config,
         .hal_config = &CYBSP_SDHC_0_sdhc_hal_config,
+        .default_io_volt = CY_SD_HOST_IO_VOLT_1_8V,
+        .max_freq_hz = CY_SDIO_MAX_FREQ_HZ,
+        .is_sdcard = RT_FALSE,
     };
 
     /* Enable SDHC hardware block */
@@ -955,7 +1053,17 @@ int rt_hw_sdio_init(void)
         .sdhc_obj = &sdhc1_obj,
         .pdl_config = &CYBSP_SDHC_1_config,
         .hal_config = &CYBSP_SDHC_1_sdhc_hal_config,
+        .default_io_volt = CY_SD_HOST_IO_VOLT_3_3V,
+        .max_freq_hz = CY_SDIO1_MAX_FREQ_HZ,
+        .is_sdcard = RT_TRUE,
     };
+
+    /* cycfg_pins.c initializes P17[7] with CY_GPIO_DM_PULLUP and outVal=0,
+     * which pulls the pin strong LOW; set outVal=1 for genuine pull-up sensing. */
+#if defined(CYBSP_SDHC_DETECT_PORT) && defined(CYBSP_SDHC_DETECT_PIN)
+    Cy_GPIO_Pin_FastInit(CYBSP_SDHC_DETECT_PORT, CYBSP_SDHC_DETECT_PIN,
+                         CY_GPIO_DM_PULLUP, 1U, HSIOM_SEL_GPIO);
+#endif
 
     /* Enable SDHC hardware block */
     Cy_SD_Host_Enable(sdhc1_hw_desc.hw_base);
@@ -980,7 +1088,10 @@ int rt_hw_sdio_init(void)
         sdio1->host->io_cfg.signal_voltage = MMCSD_SIGNAL_VOLTAGE_330;
         sdio1->en_auto_cmd12 = RT_TRUE;
         NVIC_EnableIRQ((IRQn_Type)sdhc1_isr_config.intrSrc);
-        mmcsd_change(sdio1->host);
+        if (Cy_SD_Host_IsCardConnected(CYBSP_SDHC_1_HW))
+        {
+            mmcsd_change(sdio1->host);
+        }
     }
     else
     {

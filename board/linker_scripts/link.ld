@@ -434,7 +434,7 @@ SECTIONS
     .cy_socmem_data :
     {
         . = ALIGN(4);
-        KEEP(*(EXCLUDE_FILE(*libusbh_uvc.a:usbh_uvc_stream.o) .cy_socmem_data))
+        KEEP(*(.cy_socmem_data))
 
         . = ALIGN(4);
 
@@ -504,7 +504,7 @@ SECTIONS
     {
         . = ALIGN(32);
         __cy_uvc_stream_start__ = .;
-        KEEP(*libusbh_uvc.a:usbh_uvc_stream.o(.cy_socmem_data))
+        KEEP(*(.cy_uvc_stream_data))
         . = ALIGN(32);
         __cy_uvc_stream_end__ = .;
     } > m33_m55_shared_sel

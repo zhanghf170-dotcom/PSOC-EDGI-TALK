@@ -7,6 +7,8 @@
  */
 
 #include <rtthread.h>
+#include <rtdevice.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,8 @@
 #include "alert_manager.h"
 #include "wifi_stream.h"
 #include "xiaozhi.h"
+#include "sd_assets.h"
+#include "music_player.h"
 
 #define DBG_TAG              "alert"
 #define DBG_LVL              DBG_INFO
@@ -23,7 +27,7 @@
 #define COOLDOWN_DEFAULT_MS  3000U
 #define ALERT_VOLUME_DEFAULT 75
 #define LOG_PATH_DEFAULT     "/sdcard/danger_log.txt"
-#define ALERT_WAV_PATH       "/cockpit_alarm.wav"
+#define ALERT_WAV_PATH       SD_ALARM_WAV_PATH
 
 #define ALERT_MSG_DANGER     1U
 #define ALERT_MSG_TEST_SOUND 2U
@@ -110,35 +114,77 @@ static void alert_write_danger_log(uint32_t seq, rt_tick_t evt_tick,
     m   = (sec % 3600U) / 60U;
     s   = sec % 60U;
 
-    fprintf(fp,
-            "NO.%lu | Conf:%.0f%% | Temp:%.1fC | Humi:%.1f%% | "
-            "Time:[%02lu:%02lu:%02lu] | "
-            "Do not drive while drowsy! Please rest.\n",
-            (unsigned long)seq,
-            (double)(confidence * 100.0f),
-            (double)temp, (double)humi,
-            (unsigned long)h, (unsigned long)m, (unsigned long)s);
+    {
+        char rec[224];
+        float conf_disp = isfinite(confidence) ? (confidence * 100.0f) : 0.0f;
+        float temp_disp = isfinite(temp) ? temp : 0.0f;
+        float humi_disp = isfinite(humi) ? humi : 0.0f;
+        rt_snprintf(rec, sizeof(rec),
+                    "NO.%lu | Conf:%.0f%% | Temp:%.1fC | Humi:%.1f%% | "
+                    "Time:[%02lu:%02lu:%02lu] | "
+                    "Do not drive while drowsy! Please rest.\n",
+                    (unsigned long)seq,
+                    (double)conf_disp,
+                    (double)temp_disp, (double)humi_disp,
+                    (unsigned long)h, (unsigned long)m, (unsigned long)s);
+        fputs(rec, fp);
+    }
 
     fclose(fp);
     rt_mutex_release(&g_ctx.log_lock);
 }
 
+static void alert_load_volume_cfg(void)
+{
+    FILE *fp = fopen(SD_AUDIO_CFG_PATH, "r");
+    char line[64];
+    if (fp == NULL)
+    {
+        return;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL)
+    {
+        int v = 0;
+        if (sscanf(line, "volume=%d", &v) == 1)
+        {
+            alert_set_volume(v);
+            LOG_I("restored volume=%d from %s", g_ctx.volume, SD_AUDIO_CFG_PATH);
+            break;
+        }
+    }
+    fclose(fp);
+}
+
+void alert_save_volume_cfg(void)
+{
+    FILE *fp;
+    if (!sdcard_is_mounted())
+    {
+        return;
+    }
+    fp = fopen(SD_AUDIO_CFG_PATH, "w");
+    if (fp != NULL)
+    {
+        char line[32];
+        rt_snprintf(line, sizeof(line), "volume=%d\n", g_ctx.volume);
+        fputs(line, fp);
+        fclose(fp);
+    }
+}
+
 static void alert_worker_entry(void *parameter)
 {
     alert_msg_t msg;
-    int retry;
     uint32_t restored;
 
     (void)parameter;
 
-    /* Wait briefly for mnt_init() thread to mount /sdcard, then restore persistent count */
-    for (retry = 0; retry < 20; retry++)
+    /* Wait briefly for mnt_init() thread to mount /sdcard, then restore persistent count & volume */
+    (void)sdcard_wait_mounted(3000);
+
+    if (sdcard_is_mounted())
     {
-        if (access("/sdcard", 0) == 0)
-        {
-            break;
-        }
-        rt_thread_mdelay(150);
+        alert_load_volume_cfg();
     }
 
     rt_mutex_take(&g_ctx.log_lock, RT_WAITING_FOREVER);
@@ -163,13 +209,24 @@ static void alert_worker_entry(void *parameter)
         if (msg.type == ALERT_MSG_DANGER)
         {
             xiaozhi_notify_fatigue_alert(msg.conf);
+            music_player_preempt();
             xiaozhi_audio_lock();
             wavplayer_volume_set(g_ctx.volume);
-            (void)wavplayer_play(ALERT_WAV_PATH);
-            for (int w = 0; w < 60; w++)
+            if (sdcard_is_mounted() && access(ALERT_WAV_PATH, 0) == 0)
             {
-                rt_thread_mdelay(25);
-                if (wavplayer_state_get() == PLAYER_STATE_STOPED) break;
+                if (wavplayer_play(ALERT_WAV_PATH) == RT_EOK)
+                {
+                    for (int w = 0; w < 80; w++)
+                    {
+                        rt_thread_mdelay(25);
+                        if (wavplayer_state_get() == PLAYER_STATE_STOPED) break;
+                    }
+                    (void)wavplayer_stop();
+                }
+            }
+            else
+            {
+                LOG_W("alarm wav missing on TF card: %s", ALERT_WAV_PATH);
             }
             xiaozhi_audio_unlock();
             /* Follow alarm tone with Gemini-chan cute female voice fatigue warning */
@@ -178,14 +235,31 @@ static void alert_worker_entry(void *parameter)
         }
         else if (msg.type == ALERT_MSG_TEST_SOUND)
         {
+            music_player_preempt();
             xiaozhi_audio_preempt_for_alarm();
             xiaozhi_audio_lock();
             wavplayer_volume_set(g_ctx.volume);
-            (void)wavplayer_play(ALERT_WAV_PATH);
+            if (sdcard_is_mounted() && access(ALERT_WAV_PATH, 0) == 0)
+            {
+                if (wavplayer_play(ALERT_WAV_PATH) == RT_EOK)
+                {
+                    for (int w = 0; w < 80; w++)
+                    {
+                        rt_thread_mdelay(25);
+                        if (wavplayer_state_get() == PLAYER_STATE_STOPED) break;
+                    }
+                    (void)wavplayer_stop();
+                }
+            }
+            else
+            {
+                LOG_W("alarm wav missing on TF card: %s", ALERT_WAV_PATH);
+            }
             xiaozhi_audio_unlock();
         }
         else if (msg.type == ALERT_MSG_STOP)
         {
+            music_player_preempt();
             xiaozhi_audio_preempt_for_alarm();
             (void)wavplayer_stop();
         }
@@ -357,10 +431,22 @@ float alert_get_threshold(void)
 
 void alert_set_volume(int vol)
 {
+    rt_device_t snd;
     if (vol < 0) vol = 0;
-    if (vol > 99) vol = 99;
+    if (vol > 100) vol = 100;
     g_ctx.volume = vol;
-    wavplayer_volume_set(vol);
+    wavplayer_volume_set(vol > 99 ? 99 : vol);
+
+    snd = rt_device_find(PKG_WP_PLAY_DEVICE);
+    if (snd != RT_NULL)
+    {
+        struct rt_audio_caps caps;
+        rt_memset(&caps, 0, sizeof(caps));
+        caps.main_type = AUDIO_TYPE_MIXER;
+        caps.sub_type  = AUDIO_MIXER_VOLUME;
+        caps.udata.value = vol;
+        (void)rt_device_control(snd, AUDIO_CTL_CONFIGURE, &caps);
+    }
 }
 
 int alert_get_volume(void)

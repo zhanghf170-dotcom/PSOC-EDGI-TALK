@@ -6,10 +6,16 @@
 #include "mini_jpeg_enc.h"
 #include <string.h>
 
+#if defined(__RTTHREAD__) && !defined(MINI_JPEG_HOST_TEST)
+#include <rtthread.h>
+#endif
+
 #if defined(__ARM_ARCH) && !defined(MINI_JPEG_HOST_TEST)
-#define JPEG_ITCM_SECTION __attribute__((section(".cy_itcm")))
+#define JPEG_ITCM_SECTION   __attribute__((section(".cy_itcm")))
+#define JPEG_SOCMEM_SECTION __attribute__((section(".cy_socmem_data")))
 #else
 #define JPEG_ITCM_SECTION
+#define JPEG_SOCMEM_SECTION
 #endif
 
 /* Natural-order Annex K.1 standard luminance quantization table */
@@ -222,6 +228,54 @@ static void jpeg_init_tables(jpeg_tables_t *t, int quality)
     jpeg_build_huff_table(g_dc_chroma_nrcodes, g_dc_chroma_vals, t->dc_chroma);
     jpeg_build_huff_table(g_ac_luma_nrcodes,   g_ac_luma_vals,   t->ac_luma);
     jpeg_build_huff_table(g_ac_chroma_nrcodes, g_ac_chroma_vals, t->ac_chroma);
+}
+
+/* Cache quantization & Huffman tables in SoCMEM (saves 2,784 B off wf_enc stack and avoids DTCM). */
+static JPEG_SOCMEM_SECTION jpeg_tables_t g_jpeg_tbl_cache;
+static JPEG_SOCMEM_SECTION int g_jpeg_tbl_quality = -1;
+#if defined(__RTTHREAD__) && !defined(MINI_JPEG_HOST_TEST)
+static struct rt_mutex g_jpeg_tbl_mutex;
+static rt_bool_t g_jpeg_tbl_lock_ready = RT_FALSE;
+
+static int mini_jpeg_lock_init(void)
+{
+    if (rt_mutex_init(&g_jpeg_tbl_mutex, "jpg_tbl", RT_IPC_FLAG_PRIO) == RT_EOK)
+    {
+        g_jpeg_tbl_lock_ready = RT_TRUE;
+    }
+    return RT_EOK;
+}
+INIT_COMPONENT_EXPORT(mini_jpeg_lock_init);
+#endif
+
+static const jpeg_tables_t *jpeg_acquire_tables(int quality)
+{
+    if (quality < 1) quality = 1;
+    if (quality > 100) quality = 100;
+
+#if defined(__RTTHREAD__) && !defined(MINI_JPEG_HOST_TEST)
+    if (g_jpeg_tbl_lock_ready && rt_thread_self() != RT_NULL && rt_interrupt_get_nest() == 0U)
+    {
+        (void)rt_mutex_take(&g_jpeg_tbl_mutex, RT_WAITING_FOREVER);
+    }
+#endif
+    if (g_jpeg_tbl_quality != quality)
+    {
+        jpeg_init_tables(&g_jpeg_tbl_cache, quality);
+        g_jpeg_tbl_quality = quality;
+    }
+    return &g_jpeg_tbl_cache;
+}
+
+static void jpeg_release_tables(void)
+{
+#if defined(__RTTHREAD__) && !defined(MINI_JPEG_HOST_TEST)
+    if (g_jpeg_tbl_lock_ready && rt_thread_self() != RT_NULL &&
+        rt_interrupt_get_nest() == 0U && g_jpeg_tbl_mutex.owner == rt_thread_self())
+    {
+        (void)rt_mutex_release(&g_jpeg_tbl_mutex);
+    }
+#endif
 }
 
 static inline void bw_put_byte(jpeg_bitwriter_t *bw, uint8_t b)
@@ -506,7 +560,7 @@ static JPEG_ITCM_SECTION int encode_block(jpeg_bitwriter_t *bw,
 JPEG_ITCM_SECTION size_t mini_jpeg_encode_yuyv(const uint8_t *yuyv, int width, int height,
                                                int quality, uint8_t *out_buf, size_t out_cap)
 {
-    jpeg_tables_t tbl;
+    const jpeg_tables_t *tbl;
     jpeg_bitwriter_t bw;
     float y0_blk[64], y1_blk[64], cb_blk[64], cr_blk[64];
     int dc_y = 0, dc_cb = 0, dc_cr = 0;
@@ -518,12 +572,12 @@ JPEG_ITCM_SECTION size_t mini_jpeg_encode_yuyv(const uint8_t *yuyv, int width, i
         return 0U;
     }
 
-    jpeg_init_tables(&tbl, quality);
+    tbl = jpeg_acquire_tables(quality);
     memset(&bw, 0, sizeof(bw));
     bw.buf = out_buf;
     bw.cap = out_cap;
 
-    jpeg_write_headers(&bw, &tbl, width, height);
+    jpeg_write_headers(&bw, tbl, width, height);
 
     for (my = 0; my < height; my += 8)
     {
@@ -561,13 +615,14 @@ JPEG_ITCM_SECTION size_t mini_jpeg_encode_yuyv(const uint8_t *yuyv, int width, i
                 }
             }
 
-            dc_y  = encode_block(&bw, y0_blk, tbl.inv_luma,   dc_y,  tbl.dc_luma,   tbl.ac_luma);
-            dc_y  = encode_block(&bw, y1_blk, tbl.inv_luma,   dc_y,  tbl.dc_luma,   tbl.ac_luma);
-            dc_cb = encode_block(&bw, cb_blk, tbl.inv_chroma, dc_cb, tbl.dc_chroma, tbl.ac_chroma);
-            dc_cr = encode_block(&bw, cr_blk, tbl.inv_chroma, dc_cr, tbl.dc_chroma, tbl.ac_chroma);
+            dc_y  = encode_block(&bw, y0_blk, tbl->inv_luma,   dc_y,  tbl->dc_luma,   tbl->ac_luma);
+            dc_y  = encode_block(&bw, y1_blk, tbl->inv_luma,   dc_y,  tbl->dc_luma,   tbl->ac_luma);
+            dc_cb = encode_block(&bw, cb_blk, tbl->inv_chroma, dc_cb, tbl->dc_chroma, tbl->ac_chroma);
+            dc_cr = encode_block(&bw, cr_blk, tbl->inv_chroma, dc_cr, tbl->dc_chroma, tbl->ac_chroma);
 
             if (bw.overflow)
             {
+                jpeg_release_tables();
                 return 0U;
             }
         }
@@ -575,13 +630,14 @@ JPEG_ITCM_SECTION size_t mini_jpeg_encode_yuyv(const uint8_t *yuyv, int width, i
 
     bw_flush_bits(&bw);
     bw_put_u16(&bw, 0xFFD9U); /* EOI */
+    jpeg_release_tables();
     return bw.overflow ? 0U : bw.pos;
 }
 
 JPEG_ITCM_SECTION size_t mini_jpeg_encode_rgb565(const uint16_t *rgb565, int width, int height,
                                                  int quality, uint8_t *out_buf, size_t out_cap)
 {
-    jpeg_tables_t tbl;
+    const jpeg_tables_t *tbl;
     jpeg_bitwriter_t bw;
     float y0_blk[64], y1_blk[64], cb_blk[64], cr_blk[64];
     int dc_y = 0, dc_cb = 0, dc_cr = 0;
@@ -593,12 +649,12 @@ JPEG_ITCM_SECTION size_t mini_jpeg_encode_rgb565(const uint16_t *rgb565, int wid
         return 0U;
     }
 
-    jpeg_init_tables(&tbl, quality);
+    tbl = jpeg_acquire_tables(quality);
     memset(&bw, 0, sizeof(bw));
     bw.buf = out_buf;
     bw.cap = out_cap;
 
-    jpeg_write_headers(&bw, &tbl, width, height);
+    jpeg_write_headers(&bw, tbl, width, height);
 
     for (my = 0; my < height; my += 8)
     {
@@ -654,13 +710,14 @@ JPEG_ITCM_SECTION size_t mini_jpeg_encode_rgb565(const uint16_t *rgb565, int wid
                 }
             }
 
-            dc_y  = encode_block(&bw, y0_blk, tbl.inv_luma,   dc_y,  tbl.dc_luma,   tbl.ac_luma);
-            dc_y  = encode_block(&bw, y1_blk, tbl.inv_luma,   dc_y,  tbl.dc_luma,   tbl.ac_luma);
-            dc_cb = encode_block(&bw, cb_blk, tbl.inv_chroma, dc_cb, tbl.dc_chroma, tbl.ac_chroma);
-            dc_cr = encode_block(&bw, cr_blk, tbl.inv_chroma, dc_cr, tbl.dc_chroma, tbl.ac_chroma);
+            dc_y  = encode_block(&bw, y0_blk, tbl->inv_luma,   dc_y,  tbl->dc_luma,   tbl->ac_luma);
+            dc_y  = encode_block(&bw, y1_blk, tbl->inv_luma,   dc_y,  tbl->dc_luma,   tbl->ac_luma);
+            dc_cb = encode_block(&bw, cb_blk, tbl->inv_chroma, dc_cb, tbl->dc_chroma, tbl->ac_chroma);
+            dc_cr = encode_block(&bw, cr_blk, tbl->inv_chroma, dc_cr, tbl->dc_chroma, tbl->ac_chroma);
 
             if (bw.overflow)
             {
+                jpeg_release_tables();
                 return 0U;
             }
         }
@@ -668,5 +725,6 @@ JPEG_ITCM_SECTION size_t mini_jpeg_encode_rgb565(const uint16_t *rgb565, int wid
 
     bw_flush_bits(&bw);
     bw_put_u16(&bw, 0xFFD9U); /* EOI */
+    jpeg_release_tables();
     return bw.overflow ? 0U : bw.pos;
 }

@@ -32,8 +32,8 @@ The `cm33_companion` project omits `SOC_Enable_CM33_DeepSleep`, allowing both co
 | `m55_data_secondary` | `0x26060000..0x2636FFFF` (3.06 MB) | `.cy_socmem_data`, LVGL thread stack, `.heap` | **WB/WA D-Cacheable** |
 | `m33_m55_shared` | `0x26370000..0x263AFFFF` (256 KB) | `.cy_uvc_rgb565_data` 320x240 stage (153,600 B), CM33/M55 shared | Region 2 **Non-Cacheable** |
 | `gfx_mem` | `0x263B0000..0x264FFFFF` (1.31 MB) | `graphics_buffer` + VG-Lite heap + LVGL `disp_buf1/2` | Region 3 **Non-Cacheable** |
-| `m55_hyperram` | `0x64200000..0x643FFFFF` (2 MB) | `hyperam` memheap (JPEG buffers, raw frames, stacks) | **WB/WA D-Cacheable** |
-| `m33_m55_shared_hyperram` | `0x64400000..0x64FFFFFF` (12 MB) | UVC ISO DMA pools & ML arena | Region 0 **Non-Cacheable** |
+| `m55_hyperram` | `0x64200000..0x645FFFFF` (4 MB) | `hyperam` memheap (LVGL/GIF decode, JPEG/TLS/Opus buffers, stacks) | **WB/WA D-Cacheable** |
+| `m33_m55_shared_hyperram` | `0x64600000..0x64FFFFFF` (10 MB) | UVC frame pools, Wi-Fi JPEG slots & ML arena | Region 0 **Non-Cacheable** |
 
 ---
 

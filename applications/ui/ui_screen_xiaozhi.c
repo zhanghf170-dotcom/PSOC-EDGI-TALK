@@ -16,6 +16,7 @@
 #include "ui_theme.h"
 #include "ui_manager.h"
 #include "xiaozhi.h"
+#include "sd_assets.h"
 #include "tjpgd.h"
 
 #define GEMINI_IMG_W        320U
@@ -23,16 +24,7 @@
 #define GEMINI_IMG_BYTES    (GEMINI_IMG_W * GEMINI_IMG_H * 2U)
 #define GEMINI_WORKBUF_SIZE 4096U
 #define GEMINI_EQ_BARS      5U
-
-/* Embedded 320x320 baseline JPEGs from resources/gemini/ */
-extern const unsigned char gemini_img_idle[];      extern const size_t gemini_img_idle_size;
-extern const unsigned char gemini_img_listening[]; extern const size_t gemini_img_listening_size;
-extern const unsigned char gemini_img_thinking[];  extern const size_t gemini_img_thinking_size;
-extern const unsigned char gemini_img_speaking[];  extern const size_t gemini_img_speaking_size;
-extern const unsigned char gemini_img_winking[];   extern const size_t gemini_img_winking_size;
-extern const unsigned char gemini_img_surprised[]; extern const size_t gemini_img_surprised_size;
-extern const unsigned char gemini_img_sad[];       extern const size_t gemini_img_sad_size;
-extern const unsigned char gemini_img_sleepy[];    extern const size_t gemini_img_sleepy_size;
+#define GEMINI_JPG_MAX_SIZE (128U * 1024U)
 
 typedef struct
 {
@@ -97,18 +89,18 @@ static const char *gemini_emotion_zh(xz_emotion_t emo)
     }
 }
 
-static void gemini_get_jpg_asset(xz_emotion_t emo, const uint8_t **data, size_t *size)
+static const char *gemini_jpg_path(xz_emotion_t emo)
 {
     switch (emo)
     {
-    case XZ_EMO_LISTENING: *data = gemini_img_listening; *size = gemini_img_listening_size; break;
-    case XZ_EMO_THINKING:  *data = gemini_img_thinking;  *size = gemini_img_thinking_size;  break;
-    case XZ_EMO_SPEAKING:  *data = gemini_img_speaking;  *size = gemini_img_speaking_size;  break;
-    case XZ_EMO_WINKING:   *data = gemini_img_winking;   *size = gemini_img_winking_size;   break;
-    case XZ_EMO_SURPRISED: *data = gemini_img_surprised; *size = gemini_img_surprised_size; break;
-    case XZ_EMO_SAD:       *data = gemini_img_sad;       *size = gemini_img_sad_size;       break;
-    case XZ_EMO_SLEEPY:    *data = gemini_img_sleepy;    *size = gemini_img_sleepy_size;    break;
-    default:               *data = gemini_img_idle;      *size = gemini_img_idle_size;      break;
+    case XZ_EMO_LISTENING: return SD_GEMINI_DIR "/gemini_listening.jpg";
+    case XZ_EMO_THINKING:  return SD_GEMINI_DIR "/gemini_thinking.jpg";
+    case XZ_EMO_SPEAKING:  return SD_GEMINI_DIR "/gemini_speaking.jpg";
+    case XZ_EMO_WINKING:   return SD_GEMINI_DIR "/gemini_winking.jpg";
+    case XZ_EMO_SURPRISED: return SD_GEMINI_DIR "/gemini_surprised.jpg";
+    case XZ_EMO_SAD:       return SD_GEMINI_DIR "/gemini_sad.jpg";
+    case XZ_EMO_SLEEPY:    return SD_GEMINI_DIR "/gemini_sleepy.jpg";
+    default:               return SD_GEMINI_DIR "/gemini_idle.jpg";
     }
 }
 
@@ -160,6 +152,11 @@ static void gemini_render_expression(xz_emotion_t emo)
         return;
     }
 
+    if (!sdcard_is_mounted())
+    {
+        return;
+    }
+
     if (g_avatar_pixels == RT_NULL)
     {
         g_avatar_pixels = (uint16_t *)rt_malloc_align(GEMINI_IMG_BYTES, 64);
@@ -179,37 +176,59 @@ static void gemini_render_expression(xz_emotion_t emo)
         }
     }
 
-    const uint8_t *jpg_data = NULL;
-    size_t jpg_size = 0U;
-    gemini_get_jpg_asset(emo, &jpg_data, &jpg_size);
+    const char *path = gemini_jpg_path(emo);
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL)
+    {
+        return;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        return;
+    }
+    long fsz = ftell(fp);
+    if (fsz <= 0 || (size_t)fsz > GEMINI_JPG_MAX_SIZE || fseek(fp, 0, SEEK_SET) != 0)
+    {
+        fclose(fp);
+        return;
+    }
+
+    uint8_t *jpg_data = (uint8_t *)rt_malloc((size_t)fsz);
+    if (jpg_data == RT_NULL)
+    {
+        fclose(fp);
+        return;
+    }
+    size_t nread = fread(jpg_data, 1U, (size_t)fsz, fp);
+    fclose(fp);
+    if (nread != (size_t)fsz)
+    {
+        rt_free(jpg_data);
+        return;
+    }
 
     gemini_jpg_ctx_t ctx = {
         .data   = jpg_data,
-        .size   = jpg_size,
+        .size   = nread,
         .offset = 0U,
         .dst    = g_avatar_pixels,
     };
-
-    if (jpg_size == 0U)
-    {
-        g_rendered_emo = (int)emo;
-        return;
-    }
 
     JDEC jd;
     if (jd_prepare(&jd, gemini_jpg_input_cb, g_jpg_workbuf, GEMINI_WORKBUF_SIZE, &ctx) == JDR_OK)
     {
         if (jd_decomp(&jd, gemini_jpg_output_cb, 0) == JDR_OK)
         {
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-            SCB_CleanDCache_by_Addr((uint32_t *)g_avatar_pixels, (int32_t)GEMINI_IMG_BYTES);
-#endif
+            sd_asset_dcache_clean(g_avatar_pixels, GEMINI_IMG_BYTES);
             g_rendered_emo = (int)emo;
             lv_image_cache_drop(&g_avatar_dsc);
             lv_image_set_src(g_avatar_img, &g_avatar_dsc);
+            lv_image_set_scale(g_avatar_img, LV_SCALE_NONE);
             lv_obj_invalidate(g_avatar_img);
         }
     }
+    rt_free(jpg_data);
 }
 
 /* ---------------- Event Callbacks ---------------- */
@@ -328,6 +347,8 @@ lv_obj_t *ui_screen_xiaozhi_create(void)
     lv_obj_add_event_cb(g_avatar_ring, talk_btn_cb, LV_EVENT_CLICKED, NULL);
 
     g_avatar_img = lv_image_create(g_avatar_ring);
+    lv_image_set_src(g_avatar_img, &g_ui_gemini_icon_48);
+    lv_image_set_scale(g_avatar_img, 768); /* 48 * 3 = 144x144 built-in placeholder */
     lv_obj_center(g_avatar_img);
     lv_obj_remove_flag(g_avatar_img, LV_OBJ_FLAG_CLICKABLE);
 
@@ -432,9 +453,9 @@ lv_obj_t *ui_screen_xiaozhi_create(void)
     lv_obj_set_height(g_btn_voice, 36);
     lv_obj_add_event_cb(g_btn_voice, voice_mode_btn_cb, LV_EVENT_CLICKED, NULL);
     g_lbl_voice = lv_label_create(g_btn_voice);
-    lv_label_set_text(g_lbl_voice, "萌妹音");
+    lv_label_set_text(g_lbl_voice, "云端音");
     lv_obj_set_style_text_font(g_lbl_voice, f_small, 0);
-    lv_obj_set_style_text_color(g_lbl_voice, UI_COL_GEMINI_PURPLE, 0);
+    lv_obj_set_style_text_color(g_lbl_voice, UI_COL_CYAN, 0);
     lv_obj_center(g_lbl_voice);
 
     lv_obj_t *b_multi = lv_button_create(sub_row);
@@ -486,7 +507,8 @@ void ui_screen_xiaozhi_on_leave(void)
 {
     if (g_avatar_img != NULL)
     {
-        lv_image_set_src(g_avatar_img, NULL);
+        lv_image_set_src(g_avatar_img, &g_ui_gemini_icon_48);
+        lv_image_set_scale(g_avatar_img, 768);
     }
     lv_image_cache_drop(&g_avatar_dsc);
     if (g_avatar_pixels != RT_NULL)

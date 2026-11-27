@@ -279,7 +279,7 @@ wsock_connect(wsock_state_t *pws,    uint16_t len, const char *srvname, const ch
         // pass in a pointer to a real buffer.  snprintf writes formatted data
         // into 'payload' and should return the same length as before.
         sprintf(buf, reqfmts, wspath, srvname);
-        if (bearer_token && bearer_token[0]) sprintf(buf + strlen(buf), authfmt,  bearer_token);
+        if (bearer_token)       sprintf(buf + strlen(buf), authfmt,  bearer_token);
         if (fmt)                vsprintf(buf + strlen(buf), fmt, args);
         if (pws->client_key[0]) sprintf(buf + strlen(buf), keyfmt,   pws->client_key);
         if (subproto)           sprintf(buf + strlen(buf), protfmt,  subproto);
@@ -1370,3 +1370,5 @@ const char *err2str(err_t errval)
     }
     return "UNK";
 }
+
+

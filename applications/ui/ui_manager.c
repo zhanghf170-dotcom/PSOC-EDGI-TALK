@@ -24,6 +24,7 @@ static volatile lv_dir_t  g_requested_swipe = LV_DIR_NONE;
 static uint32_t g_last_update;
 static volatile int g_requested_page = -1;
 static volatile int g_requested_clock_tab = -1;
+static volatile int g_requested_ai_mode = -1;
 static volatile unsigned g_requested_gallery_item;
 
 /* Primary carousel order for left/right horizontal swipe */
@@ -41,6 +42,7 @@ static bool is_valid_pulldown_target(ui_screen_id_t id)
     switch (id)
     {
     case UI_SCR_GALLERY:
+    case UI_SCR_MUSIC:
     case UI_SCR_WEATHER:
     case UI_SCR_XIAOZHI:
     case UI_SCR_FATIGUE:
@@ -59,12 +61,13 @@ const char *ui_pulldown_target_name(ui_screen_id_t id)
     switch (id)
     {
     case UI_SCR_GALLERY:    return "图库";
+    case UI_SCR_MUSIC:      return "音乐";
     case UI_SCR_WEATHER:    return "天气";
     case UI_SCR_XIAOZHI:    return "小智";
     case UI_SCR_FATIGUE:    return "监测";
     case UI_SCR_BRIGHTNESS: return "亮度";
     case UI_SCR_WIFI:       return "无线网络";
-    case UI_SCR_SYSTEM:     return "系统";
+    case UI_SCR_SYSTEM:     return "设置";
     case UI_SCR_CLOCK_TOOLS:return "日历计时";
     default:                return "图库";
     }
@@ -75,6 +78,7 @@ static const char *pulldown_id_to_key(ui_screen_id_t id)
     switch (id)
     {
     case UI_SCR_GALLERY:    return "gallery";
+    case UI_SCR_MUSIC:      return "music";
     case UI_SCR_WEATHER:    return "weather";
     case UI_SCR_XIAOZHI:    return "xiaozhi";
     case UI_SCR_FATIGUE:    return "fatigue";
@@ -90,6 +94,7 @@ static bool pulldown_key_to_id(const char *key, ui_screen_id_t *out)
 {
     if (key == NULL || out == NULL) return false;
     if (strcmp(key, "gallery") == 0)    { *out = UI_SCR_GALLERY;    return true; }
+    if (strcmp(key, "music") == 0)      { *out = UI_SCR_MUSIC;      return true; }
     if (strcmp(key, "weather") == 0)    { *out = UI_SCR_WEATHER;    return true; }
     if (strcmp(key, "xiaozhi") == 0 || strcmp(key, "gemini") == 0)
                                         { *out = UI_SCR_XIAOZHI;    return true; }
@@ -97,7 +102,8 @@ static bool pulldown_key_to_id(const char *key, ui_screen_id_t *out)
                                         { *out = UI_SCR_FATIGUE;    return true; }
     if (strcmp(key, "brightness") == 0) { *out = UI_SCR_BRIGHTNESS; return true; }
     if (strcmp(key, "wifi") == 0)       { *out = UI_SCR_WIFI;        return true; }
-    if (strcmp(key, "system") == 0)     { *out = UI_SCR_SYSTEM;      return true; }
+    if (strcmp(key, "system") == 0 || strcmp(key, "settings") == 0 || strcmp(key, "volume") == 0)
+                                        { *out = UI_SCR_SYSTEM;      return true; }
     if (strcmp(key, "clock") == 0 || strcmp(key, "calendar") == 0)
                                         { *out = UI_SCR_CLOCK_TOOLS; return true; }
     return false;
@@ -154,9 +160,8 @@ void ui_switch_to_anim(ui_screen_id_t id, lv_screen_load_anim_t anim, uint32_t d
     {
         if (g_active_id == UI_SCR_CAMERA)
             ui_screen_camera_on_leave(id == UI_SCR_FATIGUE);
-        else if (g_active_id == UI_SCR_FATIGUE && id != UI_SCR_CAMERA &&
-                 uvc_ai_app_get_mode() == UVC_AI_MODE_STEEL_BALL)
-            (void)uvc_app_stop();
+        else if (g_active_id == UI_SCR_FATIGUE && id != UI_SCR_CAMERA)
+            ui_screen_fatigue_on_leave();
         else if (g_active_id == UI_SCR_GALLERY)
             ui_screen_gallery_on_leave();
         else if (g_active_id == UI_SCR_WEATHER)
@@ -187,6 +192,14 @@ void ui_switch_to_anim(ui_screen_id_t id, lv_screen_load_anim_t anim, uint32_t d
         else if (id == UI_SCR_WEATHER)
         {
             ui_screen_weather_on_enter();
+        }
+        else if (id == UI_SCR_GALLERY)
+        {
+            ui_screen_gallery_on_enter();
+        }
+        else if (id == UI_SCR_MUSIC || id == UI_SCR_NOW_PLAYING)
+        {
+            ui_screen_music_on_enter();
         }
     }
 }
@@ -221,16 +234,28 @@ void ui_handle_swipe(lv_dir_t dir)
     {
         return;
     }
+    if (g_active_id == UI_SCR_CLOCK_TOOLS && ui_screen_clock_tools_handle_swipe(dir))
+    {
+        return;
+    }
+    if (g_active_id == UI_SCR_FATIGUE && ui_screen_fatigue_handle_swipe(dir))
+    {
+        return;
+    }
+    if (g_active_id == UI_SCR_NOW_PLAYING && (dir == LV_DIR_RIGHT || dir == LV_DIR_BOTTOM))
+    {
+        ui_switch_to(UI_SCR_MUSIC);
+        return;
+    }
 
-    /* Watch Face vertical gestures: Swipe Up -> Apps, Pull Down -> Configurable target (default Gallery) */
+    /* Spatial Watch Face gestures:
+     *   Above = Gallery/Shortcut (swipe DOWN to pull down)
+     *   Below = Apps (swipe UP to bring up)
+     *   Left  = AI Hub (swipe RIGHT to move to left page)
+     *   Right = Gemini-chan (swipe LEFT to move to right page)
+     */
     if (g_active_id == UI_SCR_HOME)
     {
-        if (dir == LV_DIR_TOP)
-        {
-            g_entered_via_pulldown = false;
-            ui_switch_to_anim(UI_SCR_APPS, LV_SCR_LOAD_ANIM_OVER_TOP, UI_SWIPE_ANIM_MS);
-            return;
-        }
         if (dir == LV_DIR_BOTTOM)
         {
             ui_screen_id_t target = g_pulldown_target;
@@ -239,16 +264,57 @@ void ui_handle_swipe(lv_dir_t dir)
             ui_switch_to_anim(target, LV_SCR_LOAD_ANIM_OVER_BOTTOM, UI_SWIPE_ANIM_MS);
             return;
         }
+        if (dir == LV_DIR_TOP)
+        {
+            g_entered_via_pulldown = false;
+            ui_switch_to_anim(UI_SCR_APPS, LV_SCR_LOAD_ANIM_OVER_TOP, UI_SWIPE_ANIM_MS);
+            return;
+        }
+        if (dir == LV_DIR_RIGHT)
+        {
+            g_entered_via_pulldown = false;
+            ui_screen_fatigue_open_hub();
+            ui_switch_to_anim(UI_SCR_FATIGUE, LV_SCR_LOAD_ANIM_MOVE_RIGHT, UI_SWIPE_ANIM_MS);
+            return;
+        }
+        if (dir == LV_DIR_LEFT)
+        {
+            g_entered_via_pulldown = false;
+            ui_switch_to_anim(UI_SCR_XIAOZHI, LV_SCR_LOAD_ANIM_MOVE_LEFT, UI_SWIPE_ANIM_MS);
+            return;
+        }
     }
 
-    /* Apps page: pull down returns to Watch Face */
-    if (g_active_id == UI_SCR_APPS && dir == LV_DIR_BOTTOM)
+    /* Apps page (below Home): swipe down/left/right returns to Watch Face */
+    if (g_active_id == UI_SCR_APPS)
     {
-        ui_switch_to_anim(UI_SCR_HOME, LV_SCR_LOAD_ANIM_OUT_BOTTOM, UI_SWIPE_ANIM_MS);
+        if (dir == LV_DIR_BOTTOM)
+        {
+            ui_switch_to_anim(UI_SCR_HOME, LV_SCR_LOAD_ANIM_OUT_BOTTOM, UI_SWIPE_ANIM_MS);
+            return;
+        }
+        if (dir == LV_DIR_RIGHT || dir == LV_DIR_LEFT)
+        {
+            ui_switch_to_anim(UI_SCR_HOME,
+                              dir == LV_DIR_LEFT ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+                              UI_SWIPE_ANIM_MS);
+            return;
+        }
+    }
+
+    /* Symmetric return gestures from Gemini-chan (right) and AI Hub (left) */
+    if (g_active_id == UI_SCR_XIAOZHI && dir == LV_DIR_RIGHT)
+    {
+        ui_switch_to_anim(UI_SCR_HOME, LV_SCR_LOAD_ANIM_MOVE_RIGHT, UI_SWIPE_ANIM_MS);
+        return;
+    }
+    if (g_active_id == UI_SCR_FATIGUE && dir == LV_DIR_LEFT)
+    {
+        ui_switch_to_anim(UI_SCR_HOME, LV_SCR_LOAD_ANIM_MOVE_LEFT, UI_SWIPE_ANIM_MS);
         return;
     }
 
-    /* Any page opened via Watch Face pull-down (or Gallery grid): swipe up slides back to Watch Face */
+    /* Any page opened via Watch Face pull-down (or Gallery grid): swipe up returns to Watch Face */
     if (dir == LV_DIR_TOP && (g_entered_via_pulldown || g_active_id == UI_SCR_GALLERY))
     {
         g_entered_via_pulldown = false;
@@ -318,11 +384,20 @@ int ui_request_page_by_name(const char *name)
     static const struct { const char *name; ui_screen_id_t id; } map[] = {
         {"face",       UI_SCR_HOME},
         {"home",       UI_SCR_HOME},
+        {"ai",         UI_SCR_FATIGUE},
         {"monitor",    UI_SCR_FATIGUE},
         {"fatigue",    UI_SCR_FATIGUE},
+        {"steel_ball", UI_SCR_FATIGUE},
+        {"ball",       UI_SCR_FATIGUE},
+        {"drowsy",     UI_SCR_FATIGUE},
+        {"fatigue_det",UI_SCR_FATIGUE},
         {"wifi",       UI_SCR_WIFI},
         {"system",     UI_SCR_SYSTEM},
+        {"settings",   UI_SCR_SYSTEM},
+        {"volume",     UI_SCR_SYSTEM},
         {"apps",       UI_SCR_APPS},
+        {"music",      UI_SCR_MUSIC},
+        {"song",       UI_SCR_NOW_PLAYING},
         {"weather",    UI_SCR_WEATHER},
         {"brightness", UI_SCR_BRIGHTNESS},
         {"gallery",    UI_SCR_GALLERY},
@@ -341,13 +416,17 @@ int ui_request_page_by_name(const char *name)
         if (strcmp(name, map[i].name) == 0)
         {
             int ctab = -1;
+            int aimode = -1;
             if (strcmp(name, "calendar") == 0) ctab = 0;
             else if (strcmp(name, "stopwatch") == 0) ctab = 1;
             else if (strcmp(name, "countdown") == 0 || strcmp(name, "timer") == 0) ctab = 2;
+            else if (strcmp(name, "steel_ball") == 0 || strcmp(name, "ball") == 0) aimode = UVC_AI_MODE_STEEL_BALL;
+            else if (strcmp(name, "drowsy") == 0 || strcmp(name, "fatigue_det") == 0) aimode = UVC_AI_MODE_FATIGUE;
 
             rt_base_t level = rt_hw_interrupt_disable();
             g_requested_gallery_item = 0;
             g_requested_clock_tab = ctab;
+            g_requested_ai_mode = aimode;
             g_requested_page = (int)map[i].id;
             rt_hw_interrupt_enable(level);
             return RT_EOK;
@@ -389,10 +468,12 @@ static void ui_periodic_timer_cb(lv_timer_t *timer)
     rt_base_t level = rt_hw_interrupt_disable();
     int requested = g_requested_page;
     int req_ctab  = g_requested_clock_tab;
+    int req_aimode = g_requested_ai_mode;
     unsigned item = g_requested_gallery_item;
     lv_dir_t req_swipe = g_requested_swipe;
     g_requested_page = -1;
     g_requested_clock_tab = -1;
+    g_requested_ai_mode = -1;
     g_requested_swipe = LV_DIR_NONE;
     rt_hw_interrupt_enable(level);
 
@@ -400,6 +481,11 @@ static void ui_periodic_timer_cb(lv_timer_t *timer)
     {
         if (requested == UI_SCR_CLOCK_TOOLS && req_ctab >= 0)
             ui_screen_clock_tools_open_tab(req_ctab);
+        else if (requested == UI_SCR_FATIGUE)
+        {
+            if (req_aimode >= 0) ui_screen_fatigue_open_mode(req_aimode);
+            else ui_screen_fatigue_open_hub();
+        }
         ui_switch_to((ui_screen_id_t)requested);
         if (requested == UI_SCR_GALLERY && item != 0)
             ui_screen_gallery_open(item - 1);
@@ -438,6 +524,7 @@ static void ui_periodic_timer_cb(lv_timer_t *timer)
         }
         else if (g_active_id != UI_SCR_CAMERA)
         {
+            ui_screen_fatigue_open_hub();
             ui_switch_to(UI_SCR_FATIGUE);
         }
     }
@@ -445,8 +532,9 @@ static void ui_periodic_timer_cb(lv_timer_t *timer)
     bool camera_page = g_active_id == UI_SCR_FATIGUE || g_active_id == UI_SCR_CAMERA;
     bool fast_clock  = (g_active_id == UI_SCR_CLOCK_TOOLS && ui_screen_clock_tools_is_running());
     uint32_t period = camera_page ? 32U
+                    : (g_active_id == UI_SCR_NOW_PLAYING ? 80U
                     : (fast_clock ? 40U
-                    : (g_active_id == UI_SCR_XIAOZHI ? 60U : 250U));
+                    : (g_active_id == UI_SCR_XIAOZHI ? 60U : 250U)));
     if (lv_tick_elaps(g_last_update) < period)
         return;
     g_last_update = lv_tick_get();
@@ -486,6 +574,10 @@ static void ui_periodic_timer_cb(lv_timer_t *timer)
     case UI_SCR_CLOCK_TOOLS:
         ui_screen_clock_tools_update();
         break;
+    case UI_SCR_MUSIC:
+    case UI_SCR_NOW_PLAYING:
+        ui_screen_music_update();
+        break;
     default:
         break;
     }
@@ -507,6 +599,8 @@ void lv_user_gui_init(void)
     g_screens[UI_SCR_CAMERA]      = ui_screen_camera_create();
     g_screens[UI_SCR_XIAOZHI]     = ui_screen_xiaozhi_create();
     g_screens[UI_SCR_CLOCK_TOOLS] = ui_screen_clock_tools_create();
+    g_screens[UI_SCR_MUSIC]       = ui_screen_music_create();
+    g_screens[UI_SCR_NOW_PLAYING] = ui_screen_now_playing_create();
 
     /* Attach unified left/right/up/down swipe gesture handler to every screen */
     for (unsigned i = 0; i < UI_SCR_COUNT; i++)

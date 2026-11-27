@@ -31,6 +31,7 @@ void      alert_set_threshold(float thresh);
 float     alert_get_threshold(void);
 void      alert_set_volume(int vol);
 int       alert_get_volume(void);
+void      alert_save_volume_cfg(void);
 int       alert_test_sound(void);
 int       alert_read_recent_logs(char *buf, size_t buf_size, int max_lines);
 int       alert_clear_logs(void);

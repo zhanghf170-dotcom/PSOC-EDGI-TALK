@@ -16,6 +16,7 @@
  *   - Animations automatically pause on screen leave (zero idle CPU cost)
  */
 
+#include <rtthread.h>
 #include <stdio.h>
 #include <math.h>
 #include "ui_manager.h"
@@ -824,19 +825,19 @@ void ui_screen_weather_update(void)
     }
 
     /* 3. Update Hero Card */
-    snprintf(text, sizeof(text), LV_SYMBOL_GPS " %s · 室外实况", ui_weather_city(info.city));
+    rt_snprintf(text, sizeof(text), LV_SYMBOL_GPS " %s · 室外实况", ui_weather_city(info.city));
     ui_set_label_text(g_lbl_loc, text);
     ui_set_label_text(g_lbl_cond, ui_weather_condition(info.weather_code));
     ui_set_label_text(g_lbl_tip, driving_tip_for_code(info.weather_code));
 
     /* 4. Update Indoor AHT20 Card */
-    bool aht_ok = (!isnan(g_aht_temp) && g_aht_temp > -40.0f && g_aht_temp < 85.0f &&
-                   !isnan(g_aht_humi) && g_aht_humi >= 0.0f && g_aht_humi <= 100.0f);
+    bool aht_ok = (isfinite(g_aht_temp) && g_aht_temp > -40.0f && g_aht_temp < 85.0f &&
+                   isfinite(g_aht_humi) && g_aht_humi >= 0.0f && g_aht_humi <= 100.0f);
     if (aht_ok)
     {
-        snprintf(text, sizeof(text), "%.1f ℃", (double)g_aht_temp);
+        rt_snprintf(text, sizeof(text), "%.1f ℃", (double)g_aht_temp);
         ui_set_label_text(g_lbl_in_temp, text);
-        snprintf(text, sizeof(text), "相对湿度 %.0f%%", (double)g_aht_humi);
+        rt_snprintf(text, sizeof(text), "相对湿度 %.0f%%", (double)g_aht_humi);
         ui_set_label_text(g_lbl_in_humi, text);
     }
     else
@@ -864,7 +865,7 @@ void ui_screen_weather_update(void)
     }
 
     /* Outdoor temperature + comfort scale marker (-5°C..40°C -> x 2..406) */
-    snprintf(text, sizeof(text), "%.1f°", info.temperature_tenths / 10.0);
+    rt_snprintf(text, sizeof(text), "%.1f°", info.temperature_tenths / 10.0);
     ui_set_label_text(g_lbl_temp, text);
     lv_obj_align_to(g_lbl_unit, g_lbl_temp, LV_ALIGN_OUT_RIGHT_TOP, 4, 8);
 
@@ -875,13 +876,13 @@ void ui_screen_weather_update(void)
     lv_obj_set_pos(g_temp_dot, dot_x, 229);
 
     /* Outdoor Metrics */
-    snprintf(text, sizeof(text), "%.1f ℃", info.apparent_tenths / 10.0);
+    rt_snprintf(text, sizeof(text), "%.1f ℃", info.apparent_tenths / 10.0);
     ui_set_label_text(g_lbl_app_val, info.humidity < 0 ? "--" : text);
     ui_set_label_text(g_lbl_app_tag, comfort_tag(info.apparent_tenths));
 
     if (info.humidity >= 0)
     {
-        snprintf(text, sizeof(text), "%d%%", info.humidity);
+        rt_snprintf(text, sizeof(text), "%d%%", info.humidity);
         ui_set_label_text(g_lbl_humi_val, text);
         lv_bar_set_value(g_bar_humi, info.humidity, g_anim_running ? LV_ANIM_ON : LV_ANIM_OFF);
     }
@@ -893,7 +894,7 @@ void ui_screen_weather_update(void)
 
     if (info.wind_kmh_tenths >= 0)
     {
-        snprintf(text, sizeof(text), "%.0f km/h", info.wind_kmh_tenths / 10.0);
+        rt_snprintf(text, sizeof(text), "%.0f km/h", info.wind_kmh_tenths / 10.0);
         ui_set_label_text(g_lbl_wind_val, text);
     }
     else
@@ -911,12 +912,12 @@ void ui_screen_weather_update(void)
             ui_set_label_text(g_lbl_delta, "内外温差接近");
         else if (diff > 0.0f)
         {
-            snprintf(text, sizeof(text), "车内高 +%.1f ℃", (double)diff);
+            rt_snprintf(text, sizeof(text), "车内高 +%.1f ℃", (double)diff);
             ui_set_label_text(g_lbl_delta, text);
         }
         else
         {
-            snprintf(text, sizeof(text), "车内低 %.1f ℃", (double)diff);
+            rt_snprintf(text, sizeof(text), "车内低 %.1f ℃", (double)diff);
             ui_set_label_text(g_lbl_delta, text);
         }
 
@@ -935,15 +936,15 @@ void ui_screen_weather_update(void)
     lv_obj_set_style_bg_color(g_src_dot, fresh ? UI_COL_GREEN : UI_COL_AMBER, 0);
     const char *src_str = info.source == WATCH_WEATHER_USB  ? "电脑串口" :
                           info.source == WATCH_WEATHER_WIFI ? "无线网络实况" : "局域网同步";
-    snprintf(text, sizeof(text), "%s · %s", src_str, fresh ? "数据最新" : "等待刷新");
+    rt_snprintf(text, sizeof(text), "%s · %s", src_str, fresh ? "数据最新" : "等待刷新");
     ui_set_label_text(g_lbl_status, text);
 
     struct tm local;
     time_t at = info.weather_epoch + info.offset_minutes * 60;
     if (gmtime_r(&at, &local) != NULL)
     {
-        snprintf(text, sizeof(text), "观测时间  %02d-%02d  %02d:%02d",
-                 local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min);
+        rt_snprintf(text, sizeof(text), "观测时间  %02d-%02d  %02d:%02d",
+                    local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min);
         ui_set_label_text(g_lbl_time, text);
     }
 }

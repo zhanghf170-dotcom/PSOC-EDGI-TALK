@@ -61,7 +61,7 @@ void ThingManager::Invoke(const cJSON* command) {
         }
     }
 }
-Thing* ThingManager::GetThing(const std::string& name) {
+Thing* ThingManager::GetThing(const std::string& name) {  
     for (auto& thing : things_) {
         if (thing->name() == name) {
             return thing;

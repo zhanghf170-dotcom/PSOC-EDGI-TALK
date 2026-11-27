@@ -139,49 +139,18 @@ void ifx_i2s_deinit()
 
 void ifx_set_samplerate(struct rt_audio_configure audio_config)
 {
+    uint32_t sr = (audio_config.samplerate > 0U) ? audio_config.samplerate : 16000U;
+    /* Note: i2s_playback_task duplicates each int16 sample to L+R via convert_mono_to_stereo,
+     * so 2-ch interleaved PCM streams advance at 2 * sr LRCK frames/sec while 1-ch advances at sr.
+     * CLKHF7 (49,152,000 Hz) / (TDM clkDiv=4) / (32 SCK/frame) = 384,000 Hz base LRCK. */
+    uint32_t target_lrck = (audio_config.channels <= 1U) ? sr : (sr * 2U);
+    uint64_t div_x32 = (384000ULL * 32ULL + (uint64_t)(target_lrck / 2U)) / (uint64_t)target_lrck;
+    uint32_t int_val = (div_x32 >= 64ULL) ? (uint32_t)(div_x32 / 32ULL - 1ULL) : 1U;
+    uint32_t frac_val = (div_x32 >= 64ULL) ? (uint32_t)(div_x32 % 32ULL) : 0U;
+
     Cy_SysClk_PeriPclkDisableDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U);
-    if (audio_config.channels == 1)
-    {
-        switch (audio_config.samplerate)
-        {
-            case 16000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 24U, 0U);
-                break;
-            case 24000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 15U, 0U);
-                break;
-            case 48000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 8U, 0U);
-                break;
-            case 96000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 3U, 0U);
-                break;
-            default:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 24U, 0U);
-                break;
-        }
-    }
-    else
-    {
-        switch (audio_config.samplerate)
-        {
-            case 16000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 11U, 0U);
-                break;
-            case 24000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 7U, 0U);
-                break;
-            case 48000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 3U, 0U);
-                break;
-            case 96000:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 1U, 0U);
-                break;
-            default:
-                Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 11U, 0U);
-                break;
-        }
-    }
+    Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM,
+                                     CY_SYSCLK_DIV_16_5_BIT, 0U, int_val, frac_val);
     #if defined(BSP_USING_XiaoZhi)
         Cy_SysClk_PeriPclkSetFracDivider((en_clk_dst_t)CYBSP_TDM_CONTROLLER_0_CLK_DIV_GRP_NUM, CY_SYSCLK_DIV_16_5_BIT, 0U, 15U, 0U);
     #endif

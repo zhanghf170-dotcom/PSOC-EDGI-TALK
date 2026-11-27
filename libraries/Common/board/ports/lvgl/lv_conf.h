@@ -606,7 +606,7 @@
     #define LV_CALENDAR_DEFAULT_MONTH_NAMES {"January", "February", "March",  "April", "May",  "June", "July", "August", "September", "October", "November", "December"}
     #define LV_USE_CALENDAR_HEADER_ARROW 1
     #define LV_USE_CALENDAR_HEADER_DROPDOWN 1
-    #define LV_USE_CALENDAR_CHINESE 0
+    #define LV_USE_CALENDAR_CHINESE 1
 #endif  /*LV_USE_CALENDAR*/
 
 #define LV_USE_CANVAS     1
@@ -725,11 +725,11 @@
 #endif
 
 /*API for open, read, etc*/
-#define LV_USE_FS_POSIX 0
+#define LV_USE_FS_POSIX 1
 #if LV_USE_FS_POSIX
-    #define LV_FS_POSIX_LETTER '\0'     /*Set an upper cased letter on which the drive will accessible (e.g. 'A')*/
+    #define LV_FS_POSIX_LETTER 'S'     /*Set an upper cased letter on which the drive will accessible (e.g. 'A')*/
     #define LV_FS_POSIX_PATH ""         /*Set the working directory. File/directory paths will be appended to it.*/
-    #define LV_FS_POSIX_CACHE_SIZE 0    /*>0 to cache this number of bytes in lv_fs_read()*/
+    #define LV_FS_POSIX_CACHE_SIZE 4096    /*>0 to cache this number of bytes in lv_fs_read()*/
 #endif
 
 /*API for CreateFile, ReadFile, etc*/
@@ -772,7 +772,7 @@
 #endif
 
 /*LODEPNG decoder library*/
-#define LV_USE_LODEPNG 0
+#define LV_USE_LODEPNG 1
 
 /*PNG decoder(libpng) library*/
 #define LV_USE_LIBPNG 0

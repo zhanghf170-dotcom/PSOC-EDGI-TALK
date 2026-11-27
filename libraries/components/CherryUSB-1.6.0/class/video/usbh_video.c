@@ -120,6 +120,60 @@ static int video_get_probe(struct usbh_video *video_class, uint16_t length)
                           VIDEO_VS_PROBE_CONTROL, (uint8_t *)&video_class->probe, length);
 }
 
+/* Choose from the clock intervals advertised for this frame size. */
+static uint32_t video_monitor_interval(const uint8_t *desc, uint32_t default_interval)
+{
+    const uint32_t target = 666667U; /* 15 FPS, in 100 ns units */
+    const uint8_t len = desc[0];
+    if (len < 26U)
+        return default_interval;
+
+    uint8_t count = desc[25];
+    if (count == 0U && len >= 38U) {
+        uint32_t min_interval, max_interval, step;
+        memcpy(&min_interval, desc + 26U, sizeof(min_interval));
+        memcpy(&max_interval, desc + 30U, sizeof(max_interval));
+        memcpy(&step, desc + 34U, sizeof(step));
+        if (min_interval > 0U && min_interval <= max_interval) {
+            uint32_t requested = target < min_interval ? min_interval :
+                                 (target > max_interval ? max_interval : target);
+            return step ? min_interval + ((requested - min_interval) / step) * step : requested;
+        }
+    }
+
+    uint32_t chosen = default_interval;
+    uint32_t best = (chosen > target) ? chosen - target : target - chosen;
+    for (uint8_t i = 0U; i < count && 30U + 4U * i <= len; i++) {
+        uint32_t interval;
+        memcpy(&interval, desc + 26U + 4U * i, sizeof(interval));
+        uint32_t diff = (interval > target) ? interval - target : target - interval;
+        if (interval != 0U && diff < best) {
+            best = diff;
+            chosen = interval;
+        }
+    }
+    return chosen;
+}
+
+static void video_keep_frame_rate(struct usbh_video *video)
+{
+    if (video->ae_priority_terminal == 0U)
+        return;
+
+    uint8_t priority = 0U;
+    int ret = usbh_video_get(video, VIDEO_REQUEST_GET_CUR, video->ctrl_intf,
+                             video->ae_priority_terminal, VIDEO_CT_AE_PRIORITY_CONTROL,
+                             &priority, sizeof(priority));
+    if (ret == sizeof(priority) && priority == 1U) {
+        priority = 0U;
+        ret = usbh_video_set(video, VIDEO_REQUEST_SET_CUR, video->ctrl_intf,
+                             video->ae_priority_terminal, VIDEO_CT_AE_PRIORITY_CONTROL,
+                             &priority, sizeof(priority));
+        if (ret >= 0)
+            USB_LOG_INFO("Video fixed frame rate enabled\r\n");
+    }
+}
+
 int usbh_video_open(struct usbh_video *video_class,
                     uint8_t format_type,
                     uint16_t wWidth,
@@ -155,7 +209,11 @@ int usbh_video_open(struct usbh_video *video_class,
                 if ((wWidth == video_class->format[i].frame[j].wWidth) &&
                     (wHeight == video_class->format[i].frame[j].wHeight)) {
                     frameidx = j + 1;
-                    dwDefaultFrameInterval = video_class->format[i].frame[j].dwDefaultFrameInterval;
+                    const struct usbh_video_resolution *frame = &video_class->format[i].frame[j];
+                    dwDefaultFrameInterval = (wWidth == 320U && wHeight == 240U &&
+                                              format_type == USBH_VIDEO_FORMAT_UNCOMPRESSED &&
+                                              frame->dwMonitorFrameInterval != 0U) ?
+                                             frame->dwMonitorFrameInterval : frame->dwDefaultFrameInterval;
                     found = true;
                     break;
                 }
@@ -209,6 +267,9 @@ int usbh_video_open(struct usbh_video *video_class,
         goto errout;
     }
 
+    if (format_type == USBH_VIDEO_FORMAT_UNCOMPRESSED && wWidth == 320U && wHeight == 240U)
+        video_keep_frame_rate(video_class);
+
     step = "SET_INTERFACE";
     if (!video_class->is_bulk) {
         setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_INTERFACE;
@@ -237,7 +298,8 @@ int usbh_video_open(struct usbh_video *video_class,
         USBH_EP_INIT(video_class->bulkin, ep_desc);
     }
 
-    USB_LOG_INFO("Open video and select formatidx:%u, frameidx:%u, altsetting:%u\r\n", formatidx, frameidx, altsetting);
+    USB_LOG_INFO("Open video formatidx:%u frameidx:%u altsetting:%u interval:%lu\r\n",
+                 formatidx, frameidx, altsetting, (unsigned long)video_class->commit.dwFrameInterval);
     video_class->is_opened = true;
     video_class->current_format = format_type;
     usbh_video_stream_open_result(video_class, ret);
@@ -379,6 +441,11 @@ static int usbh_video_ctrl_connect(struct usbh_hubport *hport, uint8_t intf)
                             video_class->bcdVDC = ((uint16_t)p[4] << 8) | (uint16_t)p[3];
                             break;
                         case VIDEO_VC_INPUT_TERMINAL_DESCRIPTOR_SUBTYPE:
+                            if (p[DESC_bLength] >= 16U && p[4] == (VIDEO_ITT_CAMERA & 0xffU) &&
+                                p[5] == (VIDEO_ITT_CAMERA >> 8U) && p[14] > 0U &&
+                                (p[15] & (1U << 2U))) {
+                                video_class->ae_priority_terminal = p[3];
+                            }
                             break;
                         case VIDEO_VC_OUTPUT_TERMINAL_DESCRIPTOR_SUBTYPE:
                             break;
@@ -408,11 +475,15 @@ static int usbh_video_ctrl_connect(struct usbh_hubport *hport, uint8_t intf)
                             video_class->format[format_index - 1].format_type = USBH_VIDEO_FORMAT_MJPEG;
                             break;
                         case VIDEO_VS_FRAME_UNCOMPRESSED_DESCRIPTOR_SUBTYPE:
+                            if (p[DESC_bLength] < 26U)
+                                break;
                             frame_index = p[DESC_bFrameIndex];
 
                             video_class->format[format_index - 1].frame[frame_index - 1].wWidth = ((struct video_cs_if_vs_frame_uncompressed_descriptor *)p)->wWidth;
                             video_class->format[format_index - 1].frame[frame_index - 1].wHeight = ((struct video_cs_if_vs_frame_uncompressed_descriptor *)p)->wHeight;
                             video_class->format[format_index - 1].frame[frame_index - 1].dwDefaultFrameInterval = ((struct video_cs_if_vs_frame_uncompressed_descriptor *)p)->dwDefaultFrameInterval;
+                            video_class->format[format_index - 1].frame[frame_index - 1].dwMonitorFrameInterval =
+                                video_monitor_interval(p, ((struct video_cs_if_vs_frame_uncompressed_descriptor *)p)->dwDefaultFrameInterval);
                             break;
                         case VIDEO_VS_FRAME_MJPEG_DESCRIPTOR_SUBTYPE:
                             frame_index = p[DESC_bFrameIndex];

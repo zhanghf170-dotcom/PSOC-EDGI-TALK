@@ -1,5 +1,6 @@
 #include "mcp_server.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include "../iot/thing_manager.h"
@@ -34,10 +35,11 @@ void McpServer::AddCommonTools()
 
     /* Speaker volume */
     AddTool("self.audio_speaker.set_volume",
-            "Set speaker volume (0-99).",
-            PropertyList({Property("volume", kPropertyTypeInteger, 0, 99)}),
+            "Set speaker volume (0-100).",
+            PropertyList({Property("volume", kPropertyTypeInteger, 0, 100)}),
             [](const PropertyList &props) -> ReturnValue {
                 alert_set_volume(props["volume"].value<int>());
+                alert_save_volume_cfg();
                 return true;
             });
 
@@ -75,9 +77,9 @@ void McpServer::AddCommonTools()
                 PropertyList({Property("color", kPropertyTypeString)}),
                 [led](const PropertyList &props) -> ReturnValue {
                     char buf[80];
-                    snprintf(buf, sizeof(buf),
-                             "{\"method\":\"SetLed\",\"parameters\":{\"color\":\"%s\"}}",
-                             props["color"].value<std::string>().c_str());
+                    rt_snprintf(buf, sizeof(buf),
+                                "{\"method\":\"SetLed\",\"parameters\":{\"color\":\"%s\"}}",
+                                props["color"].value<std::string>().c_str());
                     cJSON *cmd = cJSON_Parse(buf);
                     if (cmd)
                     {
@@ -102,18 +104,20 @@ void McpServer::AddCommonTools()
                 uvc_ai_app_get_telemetry(&tel);
 
                 char buf[256];
-                snprintf(buf, sizeof(buf),
-                         "Cabin %.1fC, Humidity %.1f%%, FatigueMonitor=%s, Alerts=%lu, DualCore=%s(RTT %lums), IP=%s, Brightness=%u%%",
-                         (double)g_aht_temp, (double)g_aht_humi,
-                         tel.running ? "ON" : "OFF",
-                         (unsigned long)alert_get_danger_count(),
-                         dc ? "ONLINE" : "SOLO", (unsigned long)rtt,
-                         wst.ip_str, (unsigned)lcd_get_brightness());
+                float t_disp = std::isfinite(g_aht_temp) ? g_aht_temp : 0.0f;
+                float h_disp = std::isfinite(g_aht_humi) ? g_aht_humi : 0.0f;
+                rt_snprintf(buf, sizeof(buf),
+                            "Cabin %.1fC, Humidity %.1f%%, FatigueMonitor=%s, Alerts=%lu, DualCore=%s(RTT %lums), IP=%s, Brightness=%u%%",
+                            (double)t_disp, (double)h_disp,
+                            tel.running ? "ON" : "OFF",
+                            (unsigned long)alert_get_danger_count(),
+                            dc ? "ONLINE" : "SOLO", (unsigned long)rtt,
+                            wst.ip_str, (unsigned)lcd_get_brightness());
                 return std::string(buf);
             });
 
     AddTool("self.cockpit.open_page",
-            "Switch cockpit display page: face/apps/xiaozhi/monitor/weather/wifi/system/brightness/gallery/camera.",
+            "Switch cockpit display page: face/apps/xiaozhi/monitor/weather/wifi/settings/brightness/gallery/music/camera.",
             PropertyList({Property("page", kPropertyTypeString)}),
             [](const PropertyList &props) -> ReturnValue {
                 return ui_request_page_by_name(props["page"].value<std::string>().c_str()) == RT_EOK;

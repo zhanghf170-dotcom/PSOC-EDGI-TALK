@@ -3,6 +3,7 @@
 
 #include <lvgl.h>
 #include <stdint.h>
+#include "ui_gemini_icon.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,8 @@ typedef enum
     UI_SCR_CAMERA,
     UI_SCR_XIAOZHI,
     UI_SCR_CLOCK_TOOLS,
+    UI_SCR_MUSIC,
+    UI_SCR_NOW_PLAYING,
     UI_SCR_COUNT
 } ui_screen_id_t;
 

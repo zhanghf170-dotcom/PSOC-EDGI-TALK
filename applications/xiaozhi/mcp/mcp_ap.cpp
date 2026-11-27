@@ -5,12 +5,12 @@
 #include <string.h>
 
 
-extern "C"
+extern "C" 
 {
     //注册IoT设备(可多个设备)
     void McpServer_ParseMessage(const char* message)
     {
-        McpServer::GetInstance().ParseMessage(message);
+        McpServer::GetInstance().ParseMessage(message);                
     }
 
 } // extern "C"

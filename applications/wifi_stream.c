@@ -29,6 +29,7 @@
 #include "uvc_ai_app.h"
 #include "usbh_uvc_display_hook.h"
 #include "alert_manager.h"
+#include "sd_assets.h"
 
 #define DBG_TAG "wifi.stream"
 #define DBG_LVL DBG_INFO
@@ -158,6 +159,7 @@ static struct
 
     wifi_ap_item_t scan_aps[WIFI_MGR_MAX_SCAN_APS];
     int scan_count;
+    uint32_t scan_seq;
     struct rt_mutex scan_lock;
 } g_wf;
 
@@ -173,6 +175,58 @@ static void trim_crlf(char *s)
     {
         s[--len] = '\0';
     }
+}
+
+void wifi_ssid_copy_utf8(char *dst, size_t dst_sz, const char *src)
+{
+    size_t i = 0U;
+
+    if (dst == NULL || dst_sz == 0U)
+    {
+        return;
+    }
+    if (src == NULL)
+    {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t limit = dst_sz - 1U;
+    while (src[i] != '\0' && i < limit)
+    {
+        uint8_t c = (uint8_t)src[i];
+        size_t clen;
+
+        if ((c & 0x80U) == 0x00U)
+            clen = 1U;
+        else if ((c & 0xE0U) == 0xC0U)
+            clen = 2U;
+        else if ((c & 0xF0U) == 0xE0U)
+            clen = 3U;
+        else if ((c & 0xF8U) == 0xF0U)
+            clen = 4U;
+        else
+            break;
+
+        if (i + clen > limit)
+            break;
+
+        size_t j;
+        for (j = 1U; j < clen; j++)
+        {
+            if (((uint8_t)src[i + j] & 0xC0U) != 0x80U)
+                break;
+        }
+        if (j < clen)
+            break;
+
+        for (j = 0U; j < clen; j++)
+        {
+            dst[i + j] = src[i + j];
+        }
+        i += clen;
+    }
+    dst[i] = '\0';
 }
 
 static void wifi_set_status_msg(const char *msg)
@@ -228,8 +282,7 @@ static rt_bool_t wifi_load_cfg_file(char *ssid, size_t ssid_sz,
 
         if (strcmp(k, "ssid") == 0 && ssid && ssid_sz > 0U)
         {
-            rt_strncpy(ssid, v, ssid_sz - 1U);
-            ssid[ssid_sz - 1U] = '\0';
+            wifi_ssid_copy_utf8(ssid, ssid_sz, v);
             if (ssid[0] != '\0') has_ssid = RT_TRUE;
         }
         else if (strcmp(k, "pwd") == 0 && pwd && pwd_sz > 0U)
@@ -368,9 +421,15 @@ static void wf_scan_report_cb(int event, struct rt_wlan_buff *buff, void *parame
         return;
     }
 
+    char raw_ssid[33];
     char ssid_str[33];
-    rt_memcpy(ssid_str, info->ssid.val, info->ssid.len);
-    ssid_str[info->ssid.len] = '\0';
+    rt_memcpy(raw_ssid, info->ssid.val, info->ssid.len);
+    raw_ssid[info->ssid.len] = '\0';
+    wifi_ssid_copy_utf8(ssid_str, sizeof(ssid_str), raw_ssid);
+    if (ssid_str[0] == '\0')
+    {
+        return;
+    }
 
     rt_mutex_take(&g_wf.scan_lock, RT_WAITING_FOREVER);
 
@@ -393,8 +452,7 @@ static void wf_scan_report_cb(int event, struct rt_wlan_buff *buff, void *parame
     if (g_wf.scan_count < WIFI_MGR_MAX_SCAN_APS)
     {
         wifi_ap_item_t *slot = &g_wf.scan_aps[g_wf.scan_count++];
-        rt_strncpy(slot->ssid, ssid_str, sizeof(slot->ssid) - 1U);
-        slot->ssid[sizeof(slot->ssid) - 1U] = '\0';
+        wifi_ssid_copy_utf8(slot->ssid, sizeof(slot->ssid), ssid_str);
         slot->rssi     = info->rssi;
         slot->channel  = (uint8_t)info->channel;
         slot->security = (uint32_t)info->security;
@@ -413,8 +471,7 @@ static void wf_scan_report_cb(int event, struct rt_wlan_buff *buff, void *parame
         if ((weakest_idx >= 0) && (info->rssi > min_rssi))
         {
             wifi_ap_item_t *slot = &g_wf.scan_aps[weakest_idx];
-            rt_strncpy(slot->ssid, ssid_str, sizeof(slot->ssid) - 1U);
-            slot->ssid[sizeof(slot->ssid) - 1U] = '\0';
+            wifi_ssid_copy_utf8(slot->ssid, sizeof(slot->ssid), ssid_str);
             slot->rssi     = info->rssi;
             slot->channel  = (uint8_t)info->channel;
             slot->security = (uint32_t)info->security;
@@ -451,6 +508,7 @@ static void wifi_sort_scan_results(void)
             }
         }
     }
+    g_wf.scan_seq++;
     rt_mutex_release(&g_wf.scan_lock);
 }
 
@@ -1156,14 +1214,7 @@ static void wf_mgr_thread_entry(void *parameter)
     }
 
     /* Wait briefly for /sdcard mount, then load saved credentials */
-    for (i = 0; i < 20; i++)
-    {
-        if (access("/sdcard", 0) == 0)
-        {
-            break;
-        }
-        rt_thread_mdelay(150);
-    }
+    (void)sdcard_wait_mounted(3000);
 
     if (g_wf.whd_ready)
     {
@@ -1176,8 +1227,7 @@ static void wf_mgr_thread_entry(void *parameter)
 #if defined(WIFI_DEFAULT_SSID) && defined(WIFI_DEFAULT_PWD)
         if (!has_cred && WIFI_DEFAULT_SSID[0] != '\0')
         {
-            rt_strncpy(cfg_ssid, WIFI_DEFAULT_SSID, sizeof(cfg_ssid) - 1U);
-            cfg_ssid[sizeof(cfg_ssid) - 1U] = '\0';
+            wifi_ssid_copy_utf8(cfg_ssid, sizeof(cfg_ssid), WIFI_DEFAULT_SSID);
             rt_strncpy(cfg_pwd, WIFI_DEFAULT_PWD, sizeof(cfg_pwd) - 1U);
             cfg_pwd[sizeof(cfg_pwd) - 1U] = '\0';
             has_cred = RT_TRUE;
@@ -1185,8 +1235,7 @@ static void wf_mgr_thread_entry(void *parameter)
 #endif
         if (has_cred)
         {
-            rt_strncpy(g_wf.ssid, cfg_ssid, sizeof(g_wf.ssid) - 1U);
-            g_wf.ssid[sizeof(g_wf.ssid) - 1U] = '\0';
+            wifi_ssid_copy_utf8(g_wf.ssid, sizeof(g_wf.ssid), cfg_ssid);
             rt_strncpy(g_wf.pwd,  cfg_pwd,  sizeof(g_wf.pwd) - 1U);
             g_wf.pwd[sizeof(g_wf.pwd) - 1U] = '\0';
             g_wf.connecting = RT_TRUE;
@@ -1228,6 +1277,7 @@ static void wf_mgr_thread_entry(void *parameter)
         {
             rt_mutex_take(&g_wf.scan_lock, RT_WAITING_FOREVER);
             g_wf.scan_count = 0;
+            g_wf.scan_seq++;
             rt_mutex_release(&g_wf.scan_lock);
 
             rt_wlan_register_event_handler(RT_WLAN_EVT_SCAN_REPORT, wf_scan_report_cb, RT_NULL);
@@ -1435,11 +1485,14 @@ void wifi_stream_notify_danger(uint32_t danger_count, float confidence)
 
 int wifi_stream_push_snapshot(const char *filename)
 {
+    rt_base_t level;
+
     if (!g_wf.init)
     {
         return -RT_ERROR;
     }
 
+    level = rt_hw_interrupt_disable();
     if (filename != NULL && filename[0] != '\0')
     {
         rt_strncpy(g_wf.snap_name, filename, sizeof(g_wf.snap_name) - 1U);
@@ -1451,6 +1504,7 @@ int wifi_stream_push_snapshot(const char *filename)
     }
 
     g_wf.snap_req = RT_TRUE;
+    rt_hw_interrupt_enable(level);
     if (g_wf.enc_sem != RT_NULL)
     {
         rt_sem_release(g_wf.enc_sem);
@@ -1543,8 +1597,8 @@ int wifi_mgr_connect(const char *ssid, const char *pwd, rt_bool_t save_cfg)
     if (!g_wf.init || ssid == NULL || ssid[0] == '\0') return -RT_EINVAL;
     if (!g_wf.whd_ready) return -RT_EBUSY;
 
-    rt_strncpy(g_wf.ssid, ssid, sizeof(g_wf.ssid) - 1U);
-    g_wf.ssid[sizeof(g_wf.ssid) - 1U] = '\0';
+    wifi_ssid_copy_utf8(g_wf.ssid, sizeof(g_wf.ssid), ssid);
+    if (g_wf.ssid[0] == '\0') return -RT_EINVAL;
     if (pwd != NULL)
     {
         rt_strncpy(g_wf.pwd, pwd, sizeof(g_wf.pwd) - 1U);
@@ -1587,17 +1641,20 @@ void wifi_mgr_get_status(wifi_status_t *out)
     out->tx_kbps         = (g_wf.http_clients > 0) ? g_wf.tx_kbps : 0U;
     out->frames_encoded  = g_wf.frames_encoded;
     out->relay_sent_count = g_wf.relay_sent_count;
+    out->scan_seq        = g_wf.scan_seq;
     out->rssi            = out->connected ? rt_wlan_get_rssi() : 0;
 
     if (out->connected && rt_wlan_get_info(&info) == RT_EOK && info.ssid.len > 0)
     {
+        char raw_ssid[33];
         size_t l = (info.ssid.len < 32) ? info.ssid.len : 32;
-        rt_memcpy(out->ssid, info.ssid.val, l);
-        out->ssid[l] = '\0';
+        rt_memcpy(raw_ssid, info.ssid.val, l);
+        raw_ssid[l] = '\0';
+        wifi_ssid_copy_utf8(out->ssid, sizeof(out->ssid), raw_ssid);
     }
     else
     {
-        rt_strncpy(out->ssid, g_wf.ssid, sizeof(out->ssid) - 1U);
+        wifi_ssid_copy_utf8(out->ssid, sizeof(out->ssid), g_wf.ssid);
     }
 
     wifi_get_ip_string(out->ip_str, sizeof(out->ip_str));
@@ -1679,3 +1736,91 @@ static int cmd_wifi_save(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT_ALIAS(cmd_wifi_save, wifi_save, Save Wi-Fi config to /sdcard/wifi.cfg and connect);
+
+static int wifi_mgr_inject_test_ap(const char *ssid, int rssi)
+{
+    char clean_ssid[33];
+    int idx = -1;
+
+    if (!g_wf.init)
+    {
+        return -RT_ERROR;
+    }
+
+    wifi_ssid_copy_utf8(clean_ssid, sizeof(clean_ssid), ssid);
+    if (clean_ssid[0] == '\0')
+    {
+        return -RT_EINVAL;
+    }
+
+    rt_mutex_take(&g_wf.scan_lock, RT_WAITING_FOREVER);
+    for (int i = 0; i < g_wf.scan_count; i++)
+    {
+        if (strcmp(g_wf.scan_aps[i].ssid, clean_ssid) == 0)
+        {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0)
+    {
+        if (g_wf.scan_count < WIFI_MGR_MAX_SCAN_APS)
+        {
+            idx = g_wf.scan_count++;
+        }
+        else
+        {
+            int weakest = 0;
+            for (int i = 1; i < WIFI_MGR_MAX_SCAN_APS; i++)
+            {
+                if (g_wf.scan_aps[i].rssi < g_wf.scan_aps[weakest].rssi)
+                {
+                    weakest = i;
+                }
+            }
+            idx = weakest;
+        }
+    }
+
+    wifi_ap_item_t *slot = &g_wf.scan_aps[idx];
+    wifi_ssid_copy_utf8(slot->ssid, sizeof(slot->ssid), clean_ssid);
+    slot->rssi     = (int16_t)rssi;
+    slot->channel  = 6U;
+    slot->security = 0U;
+    rt_mutex_release(&g_wf.scan_lock);
+
+    wifi_sort_scan_results();
+    return RT_EOK;
+}
+
+static int cmd_wifi_test_ssid(int argc, char **argv)
+{
+    if (!g_wf.init)
+    {
+        rt_kprintf("wifi_stream not initialized\n");
+        return -1;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "clear") == 0)
+    {
+        rt_mutex_take(&g_wf.scan_lock, RT_WAITING_FOREVER);
+        g_wf.scan_count = 0;
+        g_wf.scan_seq++;
+        rt_mutex_release(&g_wf.scan_lock);
+        rt_kprintf("Cleared Wi-Fi scan list (scan_seq=%lu)\n", (unsigned long)g_wf.scan_seq);
+        return 0;
+    }
+
+    const char *ssid = (argc >= 2) ? argv[1] : "\xe4\xba\x8c\xe5\x85\xac\xe4\xb8\x80";
+    int rssi = (argc >= 3) ? atoi(argv[2]) : -42;
+    if (wifi_mgr_inject_test_ap(ssid, rssi) != RT_EOK)
+    {
+        rt_kprintf("Failed to inject test SSID\n");
+        return -1;
+    }
+
+    rt_kprintf("Injected test AP: %s (%d dBm), scan_seq=%lu\n",
+               ssid, rssi, (unsigned long)g_wf.scan_seq);
+    return 0;
+}
+MSH_CMD_EXPORT_ALIAS(cmd_wifi_test_ssid, wifi_test_ssid, Inject or clear test Wi-Fi SSID for UI rendering test);
